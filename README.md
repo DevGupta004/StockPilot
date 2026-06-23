@@ -31,21 +31,37 @@ sentiment.
 
 | Tool | Purpose |
 |------|---------|
-| `get_daily_picks(universe=None, min_confidence=0.55)` | **Main tool.** Top 3 graded picks + summary header. |
+| `get_daily_picks(...)` | **Main tool.** Top 3 graded delivery picks + header. `horizon_days` 1 or 2. |
+| `predict_delivery_2day(...)` | Top 3 LONG delivery trades to hold up to **2 trading days (T+2)**. |
+| `predict_buy_today_sell_tomorrow(...)` | Top 3 LONG delivery trades, **T+1** (buy this session, exit next day's close). |
+| `scan_volume_spikes(min_surge=None, top_n=10)` | Stocks with a **≥`min_surge`× 7-day volume surge** + full trade plan + accumulation/distribution bias. `min_surge` omitted → `MIN_SURGE` env (default 2.0). |
+| `save_report(content, title="")` | Save a run's markdown to `reports/<branch>/<date>/<date>.md`. |
 | `analyze_stock(ticker)` | Full technical + news breakdown + verdict for one symbol. |
 | `get_technicals(ticker, lookback_days=180)` | Indicator snapshot + signal list. |
 | `get_news_sentiment(ticker)` | Recent headlines with per-article sentiment + event flags. |
 | `backtest(ticker, days=90)` | Quick historical sanity-check of the entry/exit logic. |
 
-All tickers use the NSE `.NS` suffix (e.g. `RELIANCE.NS`).
+All tickers use the NSE `.NS` suffix (e.g. `RELIANCE.NS`). Every scan tool checks the
+**current IST date/time + NSE session** and anchors Buy-by / Sell-by to *now* (see the
+`market_status` line in each result). Holding window is hard-capped at 2 trading days.
+
+**Natural language → tool:** "predict for 2 days" → `predict_delivery_2day`; "buy today
+sell tomorrow" → `predict_buy_today_sell_tomorrow`; "where is volume spiking" →
+`scan_volume_spikes`; "save this report" → `save_report` (Claude asks **Save? Y/N**
+first, then writes a dated, git-trackable markdown under `reports/<branch>/<date>/`).
 
 ---
 
 ## How it works (pipeline)
 
-1. Load the universe from config (default: 25 NSE large-caps; fully configurable).
+1. Load the universe **live from NSE** (no hardcoded lists): a preset index
+   (`nifty50/100/200/500`, `niftymidcap150`, `niftysmallcap250`, `niftynext50`, `all`)
+   is fetched from the NSE archives / nsepython and cached per day. When a `max_price`
+   is set, a cheap **batch pre-filter** narrows a large index (e.g. Nifty 500 → ~180
+   sub-₹500 names) before the heavy per-symbol work. Default preset: `nifty500`.
 2. Per symbol: fetch ~9 months of daily OHLCV via the data provider, **cached per
-   day** (local JSON) to respect rate limits.
+   day** (local JSON) and **retried with exponential backoff + jitter** to ride out
+   rate-limits.
 3. Technical indicators: EMA 9/21/50 + MACD (trend), RSI-14 + Stochastic (momentum),
    ATR + Bollinger Bands (volatility), 20-day volume avg + spike + OBV (volume).
 4. Recent news (last 24–72h) per symbol, per-article sentiment, aggregated, with
@@ -102,7 +118,22 @@ cp .env.example .env
 - Keys only ever come from env / `.env` — nothing is hardcoded.
 
 Provider selection (optional, in `.env`):
-`MARKET_PROVIDER=yfinance|twelvedata`, `NEWS_PROVIDER=marketaux|rss`.
+`MARKET_PROVIDER=yfinance|twelvedata`, `NEWS_PROVIDER=marketaux|rss`,
+`LIVE_PROVIDER=nsepython|yfinance`.
+
+### Data sources at a glance
+- **History / indicators / volume** → yfinance (free, daily EOD bars; Twelve Data as a
+  keyed fallback). This drives every signal.
+- **Live `Now` quote** → **nsepython** (`LIVE_PROVIDER=nsepython`, default): a
+  quasi-realtime NSE last-traded-price, no API key. It is an **unofficial scrape** — it
+  can rate-limit/block/timeout and returns the last close off-hours, so it falls back to
+  the yfinance delayed quote automatically. Fetched only for the final shortlist (top
+  picks), not every scanned symbol, to stay block-safe.
+- **News / sentiment** → Marketaux (key) with RSS + VADER fallback.
+
+> None of these is an official realtime tick. Signals are computed on daily closes;
+> the `Now` quote only sharpens the price you confirm against. **Your broker (Groww) is
+> the ground truth — confirm the live price before entry.**
 
 ---
 
@@ -171,7 +202,7 @@ Tunable parameters:
 
 | Param | Default | Meaning |
 |-------|---------|---------|
-| `universe` | configured watchlist | `"under500"`/`"cheap"` = liquid sub-₹500 names; or inline list |
+| `universe` | `nifty500` (live) | index preset (`nifty50/100/200/500`, `niftymidcap150`, `niftysmallcap250`, `all`) — fetched live; or inline list / single ticker |
 | `min_confidence` | `0.55` | ACTIONABLE bar |
 | `max_price` | none | only consider stocks ≤ this price (filtered on **live** price) |
 | `capital` | `150000` | trading capital (₹) for sizing |
@@ -192,6 +223,17 @@ label is the honest grade:
 The header tells you how many of the 3 cleared the bar. *"0 of 3 cleared the bar"* means
 it's a choppy day — none of them are real signals, don't force a trade.
 
+### Scanning for unusual volume
+> **"Where is volume spiking?"** → `scan_volume_spikes`
+
+Finds names whose last-7-day average volume is ≥ `min_surge`× their prior ~20-day
+baseline, then runs the full delivery analysis on survivors (entry/target/stop/Buy-by/
+Sell-by + position sizing), ranked by surge strength. Each pick reports a **bias**
+(ACCUMULATION / DISTRIBUTION / MIXED) — a surge signals *attention*, not direction.
+- *"Scan volume spikes"* → uses `MIN_SURGE` env default (2.0).
+- *"Scan volume spikes with a 1.5× threshold"* → `min_surge=1.5` (overrides env).
+- No hits = nothing cleared the bar today; lower `min_surge` or widen the universe.
+
 ### Drilling into one name
 - *"Analyze TCS.NS"* → `analyze_stock`: full technical + news + verdict for one symbol.
 - *"Show me the technicals for INFY.NS over the last 90 days"* → `get_technicals`.
@@ -203,6 +245,10 @@ it's a choppy day — none of them are real signals, don't force a trade.
 | Say this | Tool called |
 |----------|-------------|
 | "run my daily picks" / "what are today's trades" | `get_daily_picks` |
+| "predict for 2 days" / "delivery picks" | `predict_delivery_2day` |
+| "buy today sell tomorrow" | `predict_buy_today_sell_tomorrow` |
+| "where is volume spiking" / "scan volume surges" | `scan_volume_spikes` |
+| "save this report" | `save_report` |
 | "analyze \<TICKER\>" / "full breakdown of \<TICKER\>" | `analyze_stock` |
 | "technicals for \<TICKER\>" / "indicators on \<TICKER\>" | `get_technicals` |
 | "news sentiment on \<TICKER\>" | `get_news_sentiment` |
@@ -259,7 +305,8 @@ Everything tunable lives in `config.py` and is overridable via env vars:
 | `WEIGHT_TECHNICAL` / `WEIGHT_SENTIMENT` | `0.60` / `0.40` | Score blend |
 | `LOOKBACK_DAYS` | `270` | Daily history pulled |
 | `NEWS_LOOKBACK_HOURS` | `72` | News window |
-| `VOLUME_SPIKE_MULT` | `1.5` | Volume-spike threshold vs 20-day avg |
+| `VOLUME_SPIKE_MULT` | `1.5` | Volume-spike threshold vs 20-day avg (confirming signal) |
+| `MIN_SURGE` | `2.0` | `scan_volume_spikes` default: 7-day vs baseline volume multiple to qualify |
 | `ATR_TARGET_MULT` / `ATR_STOP_MULT` | `1.5` / `1.0` | Target/stop distance in ATRs |
 | `CACHE_DIR` | `.cache` | Per-day cache location |
 

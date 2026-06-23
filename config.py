@@ -42,50 +42,30 @@ def _env_int(key: str, default: int) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Universe — default NSE watchlist (yfinance uses the .NS suffix).
-# Override with STOCK_UNIVERSE="RELIANCE.NS,TCS.NS,..." or pass `universe` to the tool.
+# Universe — resolved LIVE from NSE (no hardcoded stock lists). A name is an inline
+# comma list ("RELIANCE.NS,TCS.NS"), a single ticker, or an index preset
+# ("nifty50/100/200/500", "niftymidcap150", "niftysmallcap250", "niftynext50", "all")
+# that data/universe.py fetches from the NSE archives / nsepython and caches per day.
 # --------------------------------------------------------------------------- #
-DEFAULT_UNIVERSE: list[str] = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-    "HINDUNILVR.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "KOTAKBANK.NS",
-    "LT.NS", "AXISBANK.NS", "BAJFINANCE.NS", "ASIANPAINT.NS", "MARUTI.NS",
-    "TITAN.NS", "SUNPHARMA.NS", "TATAMOTORS.NS", "WIPRO.NS", "ADANIENT.NS",
-    "TATASTEEL.NS", "HCLTECH.NS", "NTPC.NS", "POWERGRID.NS", "ONGC.NS",
-]
-
-# Liquid NSE names that usually trade under ~₹500 — a convenient starting list for
-# small-capital delivery trading. Prices drift, so the real filter is the runtime
-# ``max_price`` check on live price; this list just biases toward cheaper, liquid F&O
-# stocks so the scan isn't wasted on names that will be filtered out anyway.
-UNDER500_UNIVERSE: list[str] = [
-    "ITC.NS", "ONGC.NS", "NTPC.NS", "POWERGRID.NS", "COALINDIA.NS", "IOC.NS",
-    "BPCL.NS", "GAIL.NS", "TATASTEEL.NS", "TATAPOWER.NS", "TATAMOTORS.NS",
-    "SAIL.NS", "NMDC.NS", "VEDL.NS", "PNB.NS", "BANKBARODA.NS", "CANBK.NS",
-    "UNIONBANK.NS", "IDFCFIRSTB.NS", "FEDERALBNK.NS", "IRFC.NS", "PFC.NS",
-    "RECLTD.NS", "NHPC.NS", "ASHOKLEY.NS", "MOTHERSON.NS", "WIPRO.NS",
-    "INDUSTOWER.NS", "ZOMATO.NS", "YESBANK.NS",
-]
-
-
-_PRESETS = {
-    "nifty": DEFAULT_UNIVERSE,
-    "default": DEFAULT_UNIVERSE,
-    "under500": UNDER500_UNIVERSE,
-    "cheap": UNDER500_UNIVERSE,
-}
+DEFAULT_PRESET: str = os.environ.get("STOCK_UNIVERSE", "nifty500")
 
 
 def named_universe(name: str | None) -> list[str]:
-    """Resolve a universe by preset name, comma string, env, or the default."""
-    if not name:
-        name = os.environ.get("STOCK_UNIVERSE")  # fall back to env, then default
-    if not name:
-        return DEFAULT_UNIVERSE
+    """Resolve a universe to NSE symbols. Presets are fetched live (cached per day).
+
+    Order: explicit inline list / single ticker > given preset > STOCK_UNIVERSE env >
+    "nifty500". Returns [] if a live preset fetch fails after retries, so callers can
+    surface that instead of using stale hardcoded names.
+    """
+    # Lazy import avoids a circular import (universe.py imports CONFIG).
+    from data.universe import fetch_universe
+
+    name = name or DEFAULT_PRESET
     if "," in name:  # inline comma-separated list of symbols
         return [s.strip().upper() for s in name.split(",") if s.strip()]
-    if name.lower() in _PRESETS:  # a preset name ("under500", "nifty", ...)
-        return _PRESETS[name.lower()]
-    return [name.strip().upper()]  # a single bare symbol
+    if "." in name and " " not in name:  # a single concrete ticker e.g. RELIANCE.NS
+        return [name.strip().upper()]
+    return fetch_universe(name)
 
 
 @dataclass(frozen=True)
@@ -102,6 +82,8 @@ class Thresholds:
     min_confidence: float = _env_float("MIN_CONFIDENCE", 0.55)
     # Volume spike multiple vs 20-day average to count as a confirming signal.
     volume_spike: float = _env_float("VOLUME_SPIKE_MULT", 1.5)
+    # Default 7-day vs baseline volume surge multiple for scan_volume_spikes.
+    min_surge: float = _env_float("MIN_SURGE", 2.0)
     # ATR multiples used to derive target / stop.
     atr_target_mult: float = _env_float("ATR_TARGET_MULT", 1.5)
     atr_stop_mult: float = _env_float("ATR_STOP_MULT", 1.0)
@@ -113,6 +95,8 @@ class Providers:
     market: str = os.environ.get("MARKET_PROVIDER", "yfinance")
     # news: "marketaux" (default) or "rss"
     news: str = os.environ.get("NEWS_PROVIDER", "marketaux")
+    # live spot price: "nsepython" (quasi-realtime NSE, default) or "yfinance" (delayed)
+    live: str = os.environ.get("LIVE_PROVIDER", "nsepython")
 
 
 @dataclass(frozen=True)

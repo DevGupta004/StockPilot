@@ -68,6 +68,46 @@ def _obv(df: pd.DataFrame) -> pd.Series:
     return (direction * df["Volume"]).cumsum()
 
 
+def volume_surge(df: pd.DataFrame, window: int = 7, base: int = 20) -> dict | None:
+    """Detect a volume increase over the last `window` bars vs the prior `base` bars.
+
+    Returns a JSON-safe dict (surge_ratio, max_day_spike, price_change_7d_pct, bias,
+    raw averages) or None if the frame is too short (< window + base bars).
+    bias: ACCUMULATION (vol up & price up) / DISTRIBUTION (vol up & price down) / MIXED.
+    """
+    if df is None or len(df) < window + base:
+        return None
+    vol = df["Volume"]
+    recent = vol.iloc[-window:]
+    prior = vol.iloc[-(window + base):-window]
+    vol_recent_avg = float(recent.mean())
+    vol_base_avg = float(prior.mean())
+    if vol_base_avg <= 0:
+        return None
+    surge = vol_recent_avg / vol_base_avg
+    max_spike = float(recent.max()) / vol_base_avg
+
+    close = df["Close"]
+    price_chg = (float(close.iloc[-1]) / float(close.iloc[-window]) - 1.0) * 100.0
+    if surge >= 1.2 and price_chg > 1.0:
+        bias = "ACCUMULATION"
+    elif surge >= 1.2 and price_chg < -1.0:
+        bias = "DISTRIBUTION"
+    else:
+        bias = "MIXED"
+
+    return {
+        "surge_ratio": round(surge, 2),
+        "max_day_spike": round(max_spike, 2),
+        "vol_7d_avg": round(vol_recent_avg, 0),
+        "vol_base_avg": round(vol_base_avg, 0),
+        "price_change_7d_pct": round(price_chg, 2),
+        "bias": bias,
+        "window": window,
+        "base": base,
+    }
+
+
 def compute(df: pd.DataFrame) -> dict:
     """Compute the full indicator snapshot for the most recent bar.
 

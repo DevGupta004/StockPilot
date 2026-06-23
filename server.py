@@ -11,10 +11,14 @@ All logs go to stderr; stdout is reserved for the JSON-RPC protocol.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
+
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -42,27 +46,69 @@ def _add_trading_days(d: datetime, n: int) -> datetime:
     return d
 
 
-def _trade_schedule(as_of: str, horizon: int) -> tuple[str, str]:
-    """Concrete buy/sell schedule from the data date within the T+horizon window.
+def _market_clock() -> dict:
+    """Current NSE session status from the live IST clock.
 
-    Buy = next trading session (entry on/after open). Sell-by = close of the
-    horizon-th trading day after entry (the hard time stop). Weekends skipped;
-    holidays NOT modelled, so this is approximate near them.
+    session: "pre-open" (09:00-09:15), "open" (09:15-15:30), "closed" (other weekday
+    times), "weekend" (Sat/Sun). NSE holidays are NOT modelled — weekends only — so
+    status near an exchange holiday is approximate.
     """
-    try:
-        base = datetime.strptime(as_of, "%Y-%m-%d")
-    except (ValueError, TypeError):
-        return ("next session open", f"close of T+{horizon}")
-    buy_day = _next_trading_day(base)
+    now = datetime.now(IST)
+    weekend = now.weekday() >= 5
+    hm = now.strftime("%H:%M")
+    if weekend:
+        session = "weekend"
+    elif _MKT_OPEN <= hm <= _MKT_CLOSE:
+        session = "open"
+    elif "09:00" <= hm < _MKT_OPEN:
+        session = "pre-open"
+    else:
+        session = "closed"
+    is_trading_now = session in ("open", "pre-open")
+    # Next tradable session: today if a weekday and we're still before the close,
+    # otherwise the next weekday.
+    if not weekend and hm <= _MKT_CLOSE:
+        next_open = now
+    else:
+        next_open = _next_trading_day(now)
+    return {
+        "now_ist": now.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "weekday": now.strftime("%A"),
+        "session": session,
+        "is_trading_now": is_trading_now,
+        "next_session_open": next_open,
+        "status_line": (
+            f"Market {session.upper()} ({now:%a %d %b %H:%M} IST)"
+            + ("" if is_trading_now else
+               f" — next session {next_open:%a %d %b} {_MKT_OPEN}")
+        ),
+    }
+
+
+def _trade_schedule(horizon: int, clock: dict,
+                    entry_today: bool = False) -> tuple[str, str]:
+    """Concrete buy/sell schedule anchored to the CURRENT clock (not the data bar).
+
+    Buy = this session if we can still enter today (entry_today and market pre-open/
+    open), else the next trading session. Sell-by = close of the horizon-th trading day
+    after the buy day (the hard time stop). Weekends skipped; holidays NOT modelled.
+    """
+    if entry_today and clock.get("is_trading_now"):
+        buy_day = datetime.strptime(clock["now_ist"][:10], "%Y-%m-%d")
+        when = "today, this session"
+    else:
+        buy_day = clock["next_session_open"]
+        when = "next session"
     sell_day = _add_trading_days(buy_day, horizon)
-    buy = f"{buy_day:%a %d %b} {_MKT_OPEN}"
+    buy = f"{buy_day:%a %d %b} {_MKT_OPEN} ({when})"
     sell = f"{sell_day:%a %d %b} {_MKT_CLOSE}"
     return buy, sell
 
 from analysis import indicators as ind
 from analysis import scoring
 from config import CONFIG, DISCLAIMER, named_universe
-from data.market import get_ohlcv, get_spot_price
+from data import market
+from data.market import get_ohlcv, get_spot_price, prefilter_by_price
 from data.news import get_news_sentiment as fetch_news_sentiment
 from data.news import term_for
 from utils.log import log
@@ -90,7 +136,11 @@ def _data_quality(df) -> float:
     return round(0.5 * bar_score + 0.5 * liq_score, 3)
 
 
-def _analyze_one(ticker: str, min_confidence: float) -> scoring.Candidate | None:
+def _analyze_one(ticker: str, min_confidence: float, horizon: int | None = None,
+                 clock: dict | None = None,
+                 entry_today: bool = False) -> scoring.Candidate | None:
+    """Score one symbol. Does NOT fetch the live quote — that is done post-rank for
+    the shortlist only (see _attach_live), to avoid hammering the live provider."""
     df = get_ohlcv(ticker)
     if df is None:
         log(f"pipeline: skipping {ticker} (no data)")
@@ -103,17 +153,24 @@ def _analyze_one(ticker: str, min_confidence: float) -> scoring.Candidate | None
     news = fetch_news_sentiment(ticker)
     dq = _data_quality(df)
     cand = scoring.score_symbol(
-        ticker, _company_name(ticker), indicators, news, dq, min_confidence
+        ticker, _company_name(ticker), indicators, news, dq, min_confidence, horizon
     )
     cand.as_of = str(df.index[-1].date())  # date of the last valid price bar
     cand.provider = df.attrs.get("provider", "yfinance/cache")
-    spot = get_spot_price(ticker)  # near-live (delayed) quote, best-effort
-    if spot:
-        cand.live_price = spot["price"]
-        cand.live_as_of = spot["as_of"]
-        cand.live_kind = spot["kind"]
-    cand.buy_by, cand.sell_by = _trade_schedule(cand.as_of, cand.time_stop_days)
+    clk = clock or _market_clock()
+    cand.buy_by, cand.sell_by = _trade_schedule(
+        cand.time_stop_days, clk, entry_today)
     return cand
+
+
+def _attach_live(picks: list[scoring.Candidate]) -> None:
+    """Fetch the near-live quote for the FINAL shortlist only (cheap, block-safe)."""
+    for c in picks:
+        spot = get_spot_price(c.ticker)  # best-effort; None on failure
+        if spot:
+            c.live_price = spot["price"]
+            c.live_as_of = spot["as_of"]
+            c.live_kind = spot["kind"]
 
 
 def _table(picks: list[scoring.Candidate]) -> str:
@@ -136,59 +193,82 @@ def _table(picks: list[scoring.Candidate]) -> str:
     return "\n".join(rows)
 
 
+def _render_markdown(result: dict, tool_name: str) -> str:
+    """Build a self-contained markdown report from a scan result (ready to save)."""
+    lines = [
+        f"# {tool_name} — {result.get('generated_at', _now_ist())}",
+        "",
+        f"**{result.get('market_status', '')}**",
+        "",
+        result.get("header", ""),
+        "",
+        result.get("table", ""),
+        "",
+        "### Picks",
+    ]
+    for p in result.get("picks", []):
+        pos = p.get("position") or {}
+        lines.append(
+            f"- **#{p['rank']} {p['ticker']}** ({p.get('company','')}) — "
+            f"{p['direction']} {p['confidence_pct']}% [{p['label']}]"
+        )
+        vol = p.get("volume")
+        if vol:
+            lines.append(
+                f"  - Volume: {vol['surge_ratio']}× surge, "
+                f"{vol['price_change_7d_pct']:+.1f}% 7d, {vol['bias']}"
+            )
+        lines.append(
+            f"  - Buy by {p['buy_by']} @ ₹{p['entry']['level']} → "
+            f"target ₹{p['target']}, stop ₹{p['stop_loss']}, Sell by {p['sell_by']}"
+        )
+        if pos.get("shares"):
+            lines.append(
+                f"  - Size: {pos['shares']} sh, deploy ₹{pos.get('deploy')}, "
+                f"risk ₹{pos.get('risk_amount')} ({pos.get('capital_pct')}% capital)"
+            )
+        lines.append(f"  - {p.get('rationale','')}")
+    lines += [
+        "",
+        f"_{result.get('data_freshness','')}_",
+        "",
+        f"> {result.get('disclaimer','')}",
+    ]
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- #
 # Tools
 # --------------------------------------------------------------------------- #
-@mcp.tool()
-def get_daily_picks(universe: str | None = None,
-                    min_confidence: float | None = None,
-                    max_price: float | None = None,
-                    capital: float | None = None,
-                    risk_per_trade: float | None = None,
-                    delivery_only: bool | None = None) -> dict:
-    """Daily top-3 DELIVERY (CNC) trade candidates for the Indian (NSE) market.
+def _freshness_line(picks: list[scoring.Candidate]) -> str:
+    as_of_dates = sorted({c.as_of for c in picks if c.as_of})
+    newest = as_of_dates[-1] if as_of_dates else "unknown"
+    kinds = {c.live_kind for c in picks if c.live_price is not None}
+    if "nse-realtime" in kinds:
+        live_bit = "'Now' = NSE realtime quote (nsepython, quasi-live). "
+    elif kinds:
+        live_bit = "'Now' = near-live DELAYED quote (yfinance, ~15 min lag). "
+    else:
+        live_bit = "Live quote unavailable; "
+    provider = picks[0].provider if picks else "yfinance"
+    return (
+        f"Generated {_now_ist()}. {live_bit}"
+        f"Bars = last DAILY close (newest {newest}, source {provider}). "
+        f"Not an official tick — confirm the live price in your broker before entry."
+    )
 
-    Run once a day. ALWAYS returns the top 3 picks (or fewer only if data fetches
-    failed), ranked by a blended technical + news-sentiment score and graded honestly:
-    each is labelled ACTIONABLE (confidence >= min_confidence) or
-    "LOW CONFIDENCE - NOT RECOMMENDED". The header states how many cleared the bar.
-    Holding window is hard-capped at 2 trading days, with concrete Buy-by / Sell-by
-    dates per pick.
 
-    In delivery mode (the default), only LONG candidates are returned — short selling
-    cannot be held as delivery (CNC) on NSE, so shorts are excluded entirely rather
-    than shown as un-actionable. This is a research/idea generator, NOT a predictor:
-    it cannot tell you the "correct" stock or guarantee a move; it ranks the odds and
-    grades them honestly, and sizes each position for your capital.
+def _run_scan(*, universe: str | None, min_confidence: float | None,
+              max_price: float | None, capital: float | None,
+              risk_per_trade: float | None, delivery_only: bool | None,
+              horizon: int | None = None, entry_today: bool = False,
+              tool_name: str = "daily_picks") -> dict:
+    """Shared scan engine behind get_daily_picks and the predict_* tools.
 
-    Args:
-        universe: Optional. A preset name ("nifty"/"default", or "under500"/"cheap"
-            for liquid sub-₹500 names) or an inline comma-separated list of NSE symbols
-            (e.g. "RELIANCE.NS,TCS.NS"). Defaults to the configured watchlist.
-        min_confidence: Confidence threshold (0..1) separating ACTIONABLE picks from
-            low-confidence ideas. Omit to use MIN_CONFIDENCE from .env (default 0.55).
-        max_price: Optional. Only consider stocks whose latest price is at or below
-            this rupee value (e.g. 500.0). Omit to use MAX_PRICE from .env.
-        capital: Trading capital in rupees for position sizing. Omit to use CAPITAL
-            from .env (default 150000 / ₹1.5L).
-        risk_per_trade: Fraction of capital risked to the stop per trade. Omit to use
-            RISK_PER_TRADE from .env (default 0.02 / 2%).
-        delivery_only: If True (default), exclude SHORT candidates so every pick is a
-            holdable LONG delivery trade. Set False to also surface (flagged) shorts.
-            Omit to use DELIVERY_ONLY from .env (default True).
-
-    When called with no arguments, the trading profile in .env (STOCK_UNIVERSE,
-    MAX_PRICE, CAPITAL, RISK_PER_TRADE, MIN_CONFIDENCE, DELIVERY_ONLY) is applied.
-
-    Returns:
-        A dict with: header (summary line), actionable_count, picks (graded candidates
-        with entry/target/stop/time-stop/Buy-by/Sell-by/rationale AND a position
-        {shares, deploy, risk_amount, capital_pct}), table (markdown view), and a
-        mandatory disclaimer.
+    Resolves env-backed defaults, scans the universe, ranks the top 3, sizes each
+    position, fetches the live quote for the shortlist only, and renders the result
+    (header + market_status + table + markdown). Honest grading + disclaimer always.
     """
-    # Fall back to env-backed CONFIG defaults when an argument is omitted, so the
-    # trading profile in .env (capital, max_price, universe, bar) applies to a bare
-    # "run my daily picks".
     min_confidence = (CONFIG.thresholds.min_confidence
                       if min_confidence is None else min_confidence)
     capital = CONFIG.capital if capital is None else capital
@@ -196,17 +276,35 @@ def get_daily_picks(universe: str | None = None,
                       if risk_per_trade is None else risk_per_trade)
     cap = max_price if max_price is not None else CONFIG.max_price
     deliv = CONFIG.delivery_only if delivery_only is None else delivery_only
+    horizon = min(horizon or CONFIG.horizon_days, 2)
 
+    clock = _market_clock()
     symbols = named_universe(universe)
-    log(f"get_daily_picks: scanning {len(symbols)} symbols, bar={min_confidence}, "
-        f"max_price={cap}, capital={capital}, delivery_only={deliv}")
+    if not symbols:
+        return {
+            "header": "0 candidates — could not load the stock universe (live NSE "
+                      "fetch failed after retries). Check connectivity and retry.",
+            "generated_at": _now_ist(),
+            "market_status": clock["status_line"],
+            "actionable_count": 0,
+            "picks": [],
+            "disclaimer": DISCLAIMER,
+        }
+    # Cheap batch pre-filter by price first, so the heavy per-symbol pipeline only runs
+    # on affordable names (lets us scan large live universes like nifty500).
+    scanned = len(symbols)
+    if cap is not None and len(symbols) > 50:
+        symbols = market.prefilter_by_price(symbols, cap)
+    log(f"{tool_name}: scanning {len(symbols)}/{scanned} symbols, bar={min_confidence}, "
+        f"max_price={cap}, capital={capital}, delivery_only={deliv}, "
+        f"horizon={horizon}, session={clock['session']}")
 
     cands: list[scoring.Candidate] = []
     failed: list[str] = []
     over_price: list[str] = []
     shorts_skipped: list[str] = []
     for sym in symbols:
-        c = _analyze_one(sym, min_confidence)
+        c = _analyze_one(sym, min_confidence, horizon, clock, entry_today)
         if c is None:
             failed.append(sym)
             continue
@@ -214,8 +312,7 @@ def get_daily_picks(universe: str | None = None,
             over_price.append(sym)
             continue
         if deliv and c.direction == "SHORT":
-            # Delivery (CNC) can't hold shorts — exclude from the pool entirely.
-            shorts_skipped.append(sym)
+            shorts_skipped.append(sym)  # delivery can't hold shorts
             continue
         cands.append(c)
 
@@ -225,6 +322,8 @@ def get_daily_picks(universe: str | None = None,
         return {
             "header": f"0 candidates — {reason} today. "
                       f"Try a different universe / raise max_price and retry.",
+            "generated_at": _now_ist(),
+            "market_status": clock["status_line"],
             "actionable_count": 0,
             "picks": [],
             "failed_symbols": failed,
@@ -233,33 +332,31 @@ def get_daily_picks(universe: str | None = None,
         }
 
     picks = scoring.rank_and_grade(cands, min_confidence)
+    _attach_live(picks)  # live quote for the shortlist only (block-safe)
 
-    # Attach delivery position sizing to each pick.
     for c in picks:
         c.position = scoring.size_position(
             c.entry["level"], c.stop_loss, c.direction, capital, risk_per_trade
         )
         if c.direction == "SHORT":
-            # Short selling is intraday-only on NSE — cannot be held as delivery/CNC.
             c.position["delivery_note"] = (
                 "SHORT not allowed as delivery (CNC) — NSE permits short selling "
                 "intraday (MIS) only. Not executable as a 2-day delivery trade."
             )
 
     actionable = sum(1 for c in picks if c.label == scoring.ACTIONABLE)
-
     if actionable == 0:
         note = (f"0 of {len(picks)} cleared the bar — today is choppy, treat all "
                 f"three as ideas only, NOT trades.")
     else:
-        note = (f"{actionable} of {len(picks)} actionable today "
-                f"(min_confidence {min_confidence:.2f}).")
+        note = (f"{actionable} of {len(picks)} actionable (T+{horizon}, "
+                f"min_confidence {min_confidence:.2f}).")
     if deliv:
         note += " Delivery (CNC) mode: LONG-only."
     if cap is not None:
-        note += f" Filtered to stocks ≤ ₹{cap:.0f}."
+        note += f" Filtered to ≤ ₹{cap:.0f}."
     if failed:
-        note += f" {len(failed)} symbol(s) skipped (no data): {', '.join(failed[:5])}."
+        note += f" {len(failed)} skipped (no data): {', '.join(failed[:5])}."
     if over_price:
         note += f" {len(over_price)} above price cap."
     if shorts_skipped:
@@ -267,29 +364,13 @@ def get_daily_picks(universe: str | None = None,
     if len(picks) < 3:
         note += f" Only {len(picks)} valid candidate(s) available."
 
-    # Data freshness: yfinance free daily bars can lag 1-2 sessions (the latest bar
-    # may be NaN and is dropped). Surface the newest bar date so prices are never
-    # mistaken for live/LTP — verify against your broker before acting.
-    as_of_dates = sorted({c.as_of for c in picks if c.as_of})
-    newest = as_of_dates[-1] if as_of_dates else "unknown"
-    has_live = any(c.live_price is not None for c in picks)
-    live_bit = (
-        "'Now' = near-live DELAYED quote (yfinance, ~15 min lag). "
-        if has_live else "Live quote unavailable; "
-    )
-    freshness = (
-        f"Generated {_now_ist()}. {live_bit}"
-        f"'Close' = last DAILY close (newest {newest}, source "
-        f"{picks[0].provider or 'yfinance'}). Neither is an official tick — "
-        f"confirm the live price in your broker before entry."
-    )
-
-    return {
+    result = {
         "header": note,
         "generated_at": _now_ist(),
-        "data_freshness": freshness,
+        "market_status": clock["status_line"],
+        "data_freshness": _freshness_line(picks),
         "actionable_count": actionable,
-        "horizon_days": CONFIG.horizon_days,
+        "horizon_days": horizon,
         "capital": capital,
         "risk_per_trade": risk_per_trade,
         "max_price": cap,
@@ -301,6 +382,242 @@ def get_daily_picks(universe: str | None = None,
         "shorts_excluded": shorts_skipped,
         "disclaimer": DISCLAIMER,
     }
+    result["markdown"] = _render_markdown(result, tool_name)
+    return result
+
+
+@mcp.tool()
+def get_daily_picks(universe: str | None = None,
+                    min_confidence: float | None = None,
+                    max_price: float | None = None,
+                    capital: float | None = None,
+                    risk_per_trade: float | None = None,
+                    delivery_only: bool | None = None,
+                    horizon_days: int | None = None) -> dict:
+    """Daily top-3 DELIVERY (CNC) trade candidates for the Indian (NSE) market.
+
+    Run once a day. ALWAYS returns the top 3 picks (or fewer only if data fetches
+    failed), ranked by a blended technical + news-sentiment score and graded honestly:
+    each is labelled ACTIONABLE (confidence >= min_confidence) or
+    "LOW CONFIDENCE - NOT RECOMMENDED". The header states how many cleared the bar.
+    Holding window is hard-capped at 2 trading days, with concrete Buy-by / Sell-by
+    dates anchored to the current NSE session (see market_status in the result).
+
+    In delivery mode (the default), only LONG candidates are returned — short selling
+    cannot be held as delivery (CNC) on NSE. This is a research/idea generator, NOT a
+    predictor: it cannot tell you the "correct" stock or guarantee a move; it ranks the
+    odds and grades them honestly, and sizes each position for your capital.
+
+    Args:
+        universe: Optional. A preset name ("nifty"/"default", or "under500"/"cheap"
+            for liquid sub-₹500 names) or an inline comma-separated list of NSE symbols.
+            Defaults to the configured watchlist.
+        min_confidence: Confidence threshold (0..1). Omit to use MIN_CONFIDENCE (.env).
+        max_price: Only consider stocks at/below this rupee price. Omit for MAX_PRICE.
+        capital: Trading capital (₹) for sizing. Omit to use CAPITAL (.env, ₹1.5L).
+        risk_per_trade: Fraction of capital risked to the stop. Omit for RISK_PER_TRADE.
+        delivery_only: If True (default), exclude SHORT candidates. Omit for DELIVERY_ONLY.
+        horizon_days: Holding window in trading days, 1 or 2 (clamped to 2). Default 2.
+
+    When called with no arguments, the .env trading profile is applied.
+
+    Returns:
+        A dict with header, market_status, generated_at, actionable_count, picks
+        (graded candidates with entry/target/stop/Buy-by/Sell-by/position), table,
+        markdown (ready to save), and a mandatory disclaimer.
+    """
+    return _run_scan(
+        universe=universe, min_confidence=min_confidence, max_price=max_price,
+        capital=capital, risk_per_trade=risk_per_trade, delivery_only=delivery_only,
+        horizon=horizon_days, tool_name="daily_picks",
+    )
+
+
+@mcp.tool()
+def predict_delivery_2day(universe: str | None = None,
+                          min_confidence: float | None = None,
+                          max_price: float | None = None,
+                          capital: float | None = None,
+                          risk_per_trade: float | None = None) -> dict:
+    """Predict the top 3 DELIVERY (CNC) trades to hold for up to 2 trading days (T+2).
+
+    Same engine as get_daily_picks, fixed to a 2-trading-day delivery horizon and
+    LONG-only. Each pick has Buy-by / Sell-by dates anchored to the current NSE session,
+    a target, stop, and a position sized to your capital. Research signal, NOT a
+    guaranteed prediction.
+
+    Args mirror get_daily_picks (universe / min_confidence / max_price / capital /
+    risk_per_trade); omit any to use the .env trading profile.
+    """
+    return _run_scan(
+        universe=universe, min_confidence=min_confidence, max_price=max_price,
+        capital=capital, risk_per_trade=risk_per_trade, delivery_only=True,
+        horizon=2, tool_name="predict_delivery_2day",
+    )
+
+
+@mcp.tool()
+def predict_buy_today_sell_tomorrow(universe: str | None = None,
+                                    min_confidence: float | None = None,
+                                    max_price: float | None = None,
+                                    capital: float | None = None,
+                                    risk_per_trade: float | None = None) -> dict:
+    """Predict the top 3 DELIVERY trades to buy this session and exit by the next day (T+1).
+
+    A shorter 1-trading-day delivery hold: if the market is open/pre-open now, Buy-by is
+    "today, this session"; otherwise the next session. Sell-by is the close of the next
+    trading day (one day earlier than the 2-day tool). LONG-only, position-sized.
+    Research signal, NOT a guaranteed prediction.
+
+    Args mirror get_daily_picks; omit any to use the .env trading profile.
+    """
+    return _run_scan(
+        universe=universe, min_confidence=min_confidence, max_price=max_price,
+        capital=capital, risk_per_trade=risk_per_trade, delivery_only=True,
+        horizon=1, entry_today=True, tool_name="predict_buy_today_sell_tomorrow",
+    )
+
+
+def _volume_table(picks: list[scoring.Candidate]) -> str:
+    """Volume-scan view: surge + bias columns alongside the usual trade levels."""
+    rows = [
+        "| # | Stock | Surge | Bias | Signal | Now | Buy by | Buy | Target | Stop "
+        "| Sell by | Qty |",
+        "|---|-------|-------|------|--------|-----|--------|-----|--------|------"
+        "|---------|-----|",
+    ]
+    for c in picks:
+        flag = "✅" if c.label == scoring.ACTIONABLE else "⚠️"
+        short = " 🚫CNC" if c.direction == "SHORT" else ""
+        v = c.volume or {}
+        qty = (c.position or {}).get("shares", "-")
+        now = f"₹{c.live_price}" if c.live_price is not None else "—"
+        rows.append(
+            f"| {c.rank} | {c.ticker.replace('.NS', '')} | {v.get('surge_ratio','-')}× "
+            f"| {v.get('bias','-')} | {flag} {c.confidence_pct}%{short} | {now} "
+            f"| {c.buy_by} | ₹{c.entry['level']} | ₹{c.target} | ₹{c.stop_loss} "
+            f"| {c.sell_by} | {qty} |"
+        )
+    return "\n".join(rows)
+
+
+@mcp.tool()
+def scan_volume_spikes(universe: str | None = None, min_surge: float | None = None,
+                       top_n: int = 10, max_price: float | None = None,
+                       capital: float | None = None,
+                       risk_per_trade: float | None = None,
+                       delivery_only: bool | None = None) -> dict:
+    """Find stocks with a big VOLUME increase over the last 7 days + a full trade plan.
+
+    Scans the universe for names whose last-7-day average volume is at least `min_surge`
+    times their prior ~20-day baseline (a sign of unusual interest), then runs the full
+    delivery analysis on the survivors so each comes with entry/target/stop/Buy-by/
+    Sell-by and a position sized to your capital. Ranked by surge strength.
+
+    Honest note: a volume surge signals ATTENTION, not direction — it can be
+    accumulation (price up) or distribution (price down). This is a research signal,
+    NOT a prediction. Bias (ACCUMULATION/DISTRIBUTION/MIXED) is reported per stock.
+
+    Args:
+        universe: Preset name / inline list / default watchlist (as get_daily_picks).
+        min_surge: Minimum 7-day vs baseline volume multiple to qualify. Omit to use
+            MIN_SURGE (.env, default 2.0).
+        top_n: Max number of movers to return (ranked by surge). Default 10.
+        max_price / capital / risk_per_trade / delivery_only: as get_daily_picks; omit
+            to use the .env trading profile.
+
+    Returns:
+        A dict with header, market_status, generated_at, picks (each with a `volume`
+        block: surge_ratio, max_day_spike, price_change_7d_pct, bias), table, markdown,
+        and a mandatory disclaimer.
+    """
+    min_confidence = CONFIG.thresholds.min_confidence
+    min_surge = CONFIG.thresholds.min_surge if min_surge is None else min_surge
+    capital = CONFIG.capital if capital is None else capital
+    risk_per_trade = CONFIG.risk_per_trade if risk_per_trade is None else risk_per_trade
+    cap = max_price if max_price is not None else CONFIG.max_price
+    deliv = CONFIG.delivery_only if delivery_only is None else delivery_only
+    clock = _market_clock()
+    symbols = named_universe(universe)
+    if not symbols:
+        return {
+            "header": "0 candidates — could not load the stock universe (live NSE "
+                      "fetch failed after retries). Check connectivity and retry.",
+            "generated_at": _now_ist(),
+            "market_status": clock["status_line"],
+            "picks": [],
+            "disclaimer": DISCLAIMER,
+        }
+    if cap is not None and len(symbols) > 50:
+        symbols = prefilter_by_price(symbols, cap)
+    log(f"scan_volume_spikes: scanning {len(symbols)}, min_surge={min_surge}, "
+        f"session={clock['session']}")
+
+    surged: list[tuple[float, scoring.Candidate]] = []
+    failed: list[str] = []
+    for sym in symbols:
+        df = get_ohlcv(sym)  # cached per-day
+        if df is None:
+            failed.append(sym)
+            continue
+        vs = ind.volume_surge(df)
+        if vs is None or vs["surge_ratio"] < min_surge:
+            continue
+        if cap is not None and float(df["Close"].iloc[-1]) > cap:
+            continue
+        c = _analyze_one(sym, min_confidence, horizon=2, clock=clock)  # hits cache
+        if c is None:
+            failed.append(sym)
+            continue
+        if deliv and c.direction == "SHORT":
+            continue
+        c.volume = vs
+        surged.append((vs["surge_ratio"], c))
+
+    if not surged:
+        return {
+            "header": f"No stock showed a ≥{min_surge}× volume surge in the last 7 days "
+                      f"in this universe today.",
+            "generated_at": _now_ist(),
+            "market_status": clock["status_line"],
+            "picks": [],
+            "failed_symbols": failed,
+            "disclaimer": DISCLAIMER,
+        }
+
+    surged.sort(key=lambda x: x[0], reverse=True)
+    picks = [c for _, c in surged[:top_n]]
+    for i, c in enumerate(picks, start=1):
+        c.rank = i
+        c.label = scoring.grade(c.confidence, min_confidence)
+    _attach_live(picks)
+    for c in picks:
+        c.position = scoring.size_position(
+            c.entry["level"], c.stop_loss, c.direction, capital, risk_per_trade
+        )
+
+    actionable = sum(1 for c in picks if c.label == scoring.ACTIONABLE)
+    note = (f"{len(picks)} stock(s) with ≥{min_surge}× volume surge in last 7d "
+            f"({actionable} actionable). Surge = attention, not direction — check Bias.")
+    if deliv:
+        note += " Delivery (CNC) mode: LONG-only."
+
+    result = {
+        "header": note,
+        "generated_at": _now_ist(),
+        "market_status": clock["status_line"],
+        "data_freshness": _freshness_line(picks),
+        "actionable_count": actionable,
+        "horizon_days": 2,
+        "capital": capital,
+        "min_surge": min_surge,
+        "picks": [c.to_dict() for c in picks],
+        "table": _volume_table(picks),
+        "failed_symbols": failed,
+        "disclaimer": DISCLAIMER,
+    }
+    result["markdown"] = _render_markdown(result, "scan_volume_spikes")
+    return result
 
 
 @mcp.tool()
@@ -469,6 +786,64 @@ def backtest(ticker: str, days: int = 90) -> dict:
         "results": trades[-20:],
         "disclaimer": DISCLAIMER,
     }
+
+
+def _branch_name() -> str:
+    """Current git branch for the report folder; 'default' if unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=_PROJECT_DIR, capture_output=True, text=True, timeout=5,
+        )
+        name = out.stdout.strip()
+        if name and name != "HEAD":  # HEAD = detached
+            return "".join(c if c.isalnum() or c in "._-" else "-" for c in name)
+    except Exception as exc:  # noqa: BLE001
+        log(f"branch: could not resolve git branch: {exc}")
+    return "default"
+
+
+@mcp.tool()
+def save_report(content: str, title: str = "") -> dict:
+    """Save a tool's markdown report, organised by git branch and date.
+
+    Writes to reports/<branch>/<YYYY-MM-DD>/<YYYY-MM-DD>.md (folders created if missing,
+    branch = current git branch). Multiple runs the same day APPEND to that one daily
+    file, each separated by a timestamped heading. The file is git-trackable (not
+    ignored); this tool only writes it — it does not git add/commit.
+
+    Typical flow: run a predict_/scan_ tool, then pass its `markdown` field here as
+    `content` after the user confirms they want it saved.
+
+    Args:
+        content: The markdown to save (usually the `markdown` field from a scan result).
+        title: Optional heading for this entry (e.g. "predict_delivery_2day 2026-06-23").
+
+    Returns:
+        {path, branch, date, appended} on success, or {error} on failure.
+    """
+    if not content or not content.strip():
+        return {"error": "nothing to save (empty content)"}
+    branch = _branch_name()
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    folder = os.path.join(_PROJECT_DIR, "reports", branch, today)
+    path = os.path.join(folder, f"{today}.md")
+    stamp = datetime.now(IST).strftime("%H:%M:%S IST")
+    heading = title.strip() or "report"
+    block = f"\n\n---\n## {heading} — {stamp}\n\n{content.rstrip()}\n"
+    try:
+        os.makedirs(folder, exist_ok=True)
+        existed = os.path.exists(path)
+        with open(path, "a", encoding="utf-8") as fh:
+            if not existed:
+                fh.write(f"# Reports — {branch} — {today}\n")
+            fh.write(block)
+    except OSError as exc:
+        log(f"save_report: write failed {path}: {exc}")
+        return {"error": f"could not write report: {exc}"}
+    rel = os.path.relpath(path, _PROJECT_DIR)
+    log(f"save_report: appended to {rel}")
+    return {"path": rel, "branch": branch, "date": today, "appended": True}
 
 
 if __name__ == "__main__":

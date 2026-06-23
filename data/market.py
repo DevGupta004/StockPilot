@@ -20,6 +20,7 @@ import pandas as pd
 from config import CONFIG
 from utils.cache import DayCache
 from utils.log import log
+from utils.retry import retry_call
 
 _CACHE = DayCache(CONFIG.cache_dir)
 _OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
@@ -150,7 +151,17 @@ def get_ohlcv(ticker: str, lookback_days: int | None = None) -> pd.DataFrame | N
 
     for prov_name in order:
         provider = _make_provider(prov_name)
-        df = provider.fetch(ticker, lookback)
+
+        def _fetch(p=provider):
+            out = p.fetch(ticker, lookback)
+            if out is None:  # raise so retry_call backs off + retries the provider
+                raise RuntimeError("empty fetch")
+            return out
+
+        # Retry transient rate-limits/blips with backoff before falling to the next
+        # provider. retry_call returns None after the last attempt (default=None).
+        df = retry_call(_fetch, attempts=3, base=1.5,
+                        label=f"ohlcv:{prov_name}:{ticker}", default=None)
         if df is not None and len(df) >= 30:  # need enough bars for indicators
             df.attrs["provider"] = provider.name
             df.attrs["fetched_at"] = datetime.now(timezone.utc).isoformat()
@@ -165,14 +176,95 @@ def get_ohlcv(ticker: str, lookback_days: int | None = None) -> pd.DataFrame | N
     return None
 
 
+def _nse_realtime(ticker: str) -> dict | None:
+    """Quasi-realtime NSE last-traded-price via nsepython (scrapes NSE; no API key).
+
+    Returns {price, as_of, kind: "nse-realtime"} or None. nsepython is synchronous and
+    can rate-limit / block / timeout — callers must tolerate None and fall back.
+    """
+    try:
+        from nsepython import nse_quote_ltp
+    except ImportError:
+        log("nsepython not installed; skipping realtime quote")
+        return None
+    symbol = ticker.upper().removesuffix(".NS").removesuffix(".BO")
+    try:
+        price = float(nse_quote_ltp(symbol))
+        if price and price > 0:
+            return {
+                "price": round(price, 2),
+                "as_of": datetime.now(timezone.utc).isoformat(),
+                "kind": "nse-realtime",
+            }
+    except Exception as exc:  # noqa: BLE001 - scraper can fail many ways
+        log(f"nse realtime: failed for {ticker}: {exc}")
+    return None
+
+
+def prefilter_by_price(symbols: list[str], max_price: float,
+                       chunk: int = 100) -> list[str]:
+    """Cheaply narrow a large universe to symbols trading at/below ``max_price``.
+
+    Batch-downloads the latest close for all symbols in a few yfinance calls (instead
+    of one fetch per symbol), so a 500-name universe is filtered with ~5 requests
+    before the heavy per-symbol pipeline runs. Retry-wrapped; on failure a chunk is
+    kept (not dropped) so we never silently lose candidates. Cached per day.
+    """
+    if not symbols or max_price is None:
+        return symbols
+
+    cache_key = f"pricefilter_{int(max_price)}_{len(symbols)}"
+    cached = _CACHE.get_data("prefilter", cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        return symbols
+
+    kept: list[str] = []
+    for i in range(0, len(symbols), chunk):
+        batch = symbols[i:i + chunk]
+
+        def _do(b=batch):
+            return yf.download(b, period="5d", interval="1d", auto_adjust=False,
+                               progress=False, threads=True, group_by="ticker")
+
+        try:
+            df = retry_call(_do, attempts=3, base=1.5,
+                            label=f"prefilter[{i // chunk}]")
+        except Exception as exc:  # noqa: BLE001
+            log(f"prefilter: batch {i // chunk} failed ({exc}); keeping it unfiltered")
+            kept.extend(batch)
+            continue
+
+        for sym in batch:
+            try:
+                close = df[sym]["Close"].dropna() if sym in df else df["Close"].dropna()
+                if len(close) and float(close.iloc[-1]) <= max_price:
+                    kept.append(sym)
+            except Exception:  # noqa: BLE001 - keep on any parse ambiguity
+                kept.append(sym)
+
+    log(f"prefilter: {len(kept)}/{len(symbols)} symbols ≤ ₹{max_price:.0f}")
+    _CACHE.set("prefilter", cache_key, kept)
+    return kept
+
+
 def get_spot_price(ticker: str) -> dict | None:
     """Fetch the most-current price available (near-live), with its timestamp.
 
-    Tries yfinance ``fast_info.last_price`` (delayed real-time quote), then a 1-minute
-    intraday bar, then None. NOT cached — it is meant to be as fresh as the free feed
-    allows. Returns {price, as_of (ISO ts), kind} where kind is "live"/"intraday", or
-    None on failure. Still a DELAYED quote, never an official tick.
+    Provider order is set by LIVE_PROVIDER (default "nsepython"): tries nsepython's
+    quasi-realtime NSE LTP first, then falls back to yfinance ``fast_info`` (delayed
+    quote) and a 1-minute intraday bar. NOT cached. Returns {price, as_of (ISO ts),
+    kind} or None. Even the realtime path is unofficial — never treat as a true tick.
     """
+    if CONFIG.providers.live == "nsepython":
+        nse = _nse_realtime(ticker)
+        if nse:
+            return nse
+        # fall through to yfinance on any nsepython failure
     try:
         import yfinance as yf
     except ImportError:
