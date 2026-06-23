@@ -4,6 +4,8 @@ mcp[cli]>=1.25,<2
 
 # Market data
 yfinance>=0.2.40
+# Quasi-realtime NSE last-traded-price for the live "Now" quote (unofficial scrape).
+nsepython>=2.0
 
 # News + sentiment
 feedparser>=6.0.11

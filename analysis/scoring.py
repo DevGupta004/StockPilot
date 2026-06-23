@@ -52,6 +52,7 @@ class Candidate:
     live_kind: str = ""               # "delayed-quote" / "intraday-1m"
     buy_by: str = ""                  # planned entry session (date + open)
     sell_by: str = ""                 # hard sell deadline (date + close, T+horizon)
+    volume: dict | None = None        # 7-day volume-surge block (scan_volume_spikes)
     # Position sizing (filled after ranking; zeros until then).
     position: dict | None = None  # {shares, deploy, risk_amount, capital_pct, note}
 
@@ -185,11 +186,13 @@ def _sentiment_score(news: dict) -> tuple[float, list[str]]:
 # --------------------------------------------------------------------------- #
 # Entry / exit within the 2-day horizon
 # --------------------------------------------------------------------------- #
-def _entry_exit(t: dict, direction: str) -> tuple[dict, float, float, int, str]:
+def _entry_exit(t: dict, direction: str,
+                horizon: int | None = None) -> tuple[dict, float, float, int, str]:
     price = t["price"]
     atr = t["atr14"] or (price * 0.02)
     th = CONFIG.thresholds
-    horizon = min(CONFIG.horizon_days, 2)  # structurally clamp to <= 2 trading days
+    # Structurally clamp to <= 2 trading days no matter what the caller asks for.
+    horizon = min(horizon or CONFIG.horizon_days, 2)
 
     if direction == "LONG":
         ema21 = t["ema21"]
@@ -255,7 +258,8 @@ def grade(confidence: float, min_confidence: float) -> str:
 # Public: score one symbol
 # --------------------------------------------------------------------------- #
 def score_symbol(ticker: str, company: str, indicators: dict, news: dict,
-                 data_quality: float, min_confidence: float) -> Candidate:
+                 data_quality: float, min_confidence: float,
+                 horizon: int | None = None) -> Candidate:
     tech_score, tech_drivers, direction = _technical_signals(indicators)
     sent_score, sent_drivers = _sentiment_score(news)
 
@@ -265,7 +269,8 @@ def score_symbol(ticker: str, company: str, indicators: dict, news: dict,
     blended = w.technical * tech_score + w.sentiment * sent_score
     confidence = _confidence(tech_score, sent_score, news, data_quality, direction)
 
-    entry, target, stop, horizon, time_stop = _entry_exit(indicators, direction)
+    entry, target, stop, horizon, time_stop = _entry_exit(
+        indicators, direction, horizon)
 
     drivers = tech_drivers[:3] + sent_drivers[:2]
     key_tech = tech_drivers[0] if tech_drivers else "mixed technicals"
