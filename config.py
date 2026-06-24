@@ -62,10 +62,21 @@ def named_universe(name: str | None) -> list[str]:
 
     name = name or DEFAULT_PRESET
     if "," in name:  # inline comma-separated list of symbols
-        return [s.strip().upper() for s in name.split(",") if s.strip()]
+        return [_nse(s) for s in name.split(",") if s.strip()]
     if "." in name and " " not in name:  # a single concrete ticker e.g. RELIANCE.NS
-        return [name.strip().upper()]
+        return [_nse(name)]
+    from data.universe import is_preset
+    if is_preset(name):  # a known preset/index name -> fetch live
+        return fetch_universe(name)
+    if " " not in name:  # bare single symbol e.g. "RELIANCE" -> treat as NSE ticker
+        return [_nse(name)]
     return fetch_universe(name)
+
+
+def _nse(sym: str) -> str:
+    """Normalize a symbol to a yfinance NSE ticker: append .NS if no exchange suffix."""
+    s = sym.strip().upper()
+    return s if s.endswith((".NS", ".BO")) else f"{s}.NS"
 
 
 @dataclass(frozen=True)
@@ -91,7 +102,10 @@ class Thresholds:
 
 @dataclass(frozen=True)
 class Providers:
-    # market: "yfinance" (default) or "twelvedata"
+    # market: "yfinance" (default) | "yahoo_chart" (keyless raw Yahoo) | "twelvedata".
+    # Whatever is set is tried first; the others are automatic fallbacks (yfinance ->
+    # yahoo_chart -> twelvedata). yahoo_chart needs no key; twelvedata is skipped if
+    # TWELVEDATA_API_KEY is unset.
     market: str = os.environ.get("MARKET_PROVIDER", "yfinance")
     # news: "marketaux" (default) or "rss"
     news: str = os.environ.get("NEWS_PROVIDER", "marketaux")

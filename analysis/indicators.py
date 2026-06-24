@@ -8,8 +8,24 @@ floats / bools so the result is JSON-serialisable.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
+
+
+def _clean(value: float, fallback: float) -> float:
+    """Return ``value`` rounded to a finite float, or ``fallback`` if NaN/inf.
+
+    Guards against non-finite indicator values (e.g. RSI when there are no down days,
+    Stochastic on a flat range) reaching the JSON output — NaN/Infinity are not valid
+    JSON and would corrupt the MCP response or propagate into entry/stop arithmetic.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return round(float(fallback), 4)
+    return round(v if math.isfinite(v) else float(fallback), 4)
 
 try:  # pandas-ta is optional; we hand-roll everything below as a fallback.
     import pandas_ta as pta  # noqa: F401
@@ -142,28 +158,30 @@ def compute(df: pd.DataFrame) -> dict:
 
     obv_trend_up = bool(obv.iloc[-1] > obv.iloc[-5]) if len(obv) > 5 else False
 
+    # Every numeric is cleaned to a finite float (NaN/inf -> a neutral fallback) so the
+    # snapshot is always JSON-safe and downstream entry/stop math never sees NaN.
     return {
-        "price": round(last, 2),
-        "ema9": round(_f(ema9), 2),
-        "ema21": round(_f(ema21), 2),
-        "ema50": round(_f(ema50), 2),
-        "rsi14": round(_f(rsi), 2),
-        "macd": round(_f(macd_line), 4),
-        "macd_signal": round(_f(macd_signal), 4),
-        "macd_hist": round(_f(macd_hist), 4),
+        "price": _clean(last, last),
+        "ema9": _clean(_f(ema9), last),
+        "ema21": _clean(_f(ema21), last),
+        "ema50": _clean(_f(ema50), last),
+        "rsi14": _clean(_f(rsi), 50.0),
+        "macd": _clean(_f(macd_line), 0.0),
+        "macd_signal": _clean(_f(macd_signal), 0.0),
+        "macd_hist": _clean(_f(macd_hist), 0.0),
         "macd_cross_up": macd_cross_up,
         "ema_cross_up": ema_cross_up,
-        "atr14": round(_f(atr), 2),
-        "stoch_k": round(_f(pct_k), 2),
-        "stoch_d": round(_f(pct_d), 2),
-        "bb_upper": round(_f(bb_up), 2),
-        "bb_mid": round(_f(bb_mid), 2),
-        "bb_lower": round(_f(bb_low), 2),
+        "atr14": _clean(_f(atr), round(last * 0.02, 2)),
+        "stoch_k": _clean(_f(pct_k), 50.0),
+        "stoch_d": _clean(_f(pct_d), 50.0),
+        "bb_upper": _clean(_f(bb_up), last),
+        "bb_mid": _clean(_f(bb_mid), last),
+        "bb_lower": _clean(_f(bb_low), last),
         "obv_trend_up": obv_trend_up,
-        "vol_last": round(vol_last, 0),
-        "vol_avg20": round(vol_avg20, 0),
-        "vol_spike_ratio": round(vol_last / vol_avg20, 2) if vol_avg20 else 0.0,
-        "recent_high20": round(float(df["High"].rolling(20).max().iloc[-1]), 2),
-        "recent_low20": round(float(df["Low"].rolling(20).min().iloc[-1]), 2),
+        "vol_last": _clean(vol_last, 0.0),
+        "vol_avg20": _clean(vol_avg20, 0.0),
+        "vol_spike_ratio": _clean(vol_last / vol_avg20, 0.0) if vol_avg20 else 0.0,
+        "recent_high20": _clean(float(df["High"].rolling(20).max().iloc[-1]), last),
+        "recent_low20": _clean(float(df["Low"].rolling(20).min().iloc[-1]), last),
         "engine": "pandas-ta" if _HAS_PTA else "builtin",
     }

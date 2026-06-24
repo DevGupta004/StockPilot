@@ -15,9 +15,19 @@ never carry a horizon longer than 2 trading days.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 from config import CONFIG
+
+
+def _pos(value: float, fallback: float) -> float:
+    """Return a finite, positive float or ``fallback`` (guards entry/stop math)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return v if math.isfinite(v) and v > 0 else fallback
 
 ACTIONABLE = "ACTIONABLE"
 LOW_CONF = "LOW CONFIDENCE - NOT RECOMMENDED"
@@ -188,8 +198,8 @@ def _sentiment_score(news: dict) -> tuple[float, list[str]]:
 # --------------------------------------------------------------------------- #
 def _entry_exit(t: dict, direction: str,
                 horizon: int | None = None) -> tuple[dict, float, float, int, str]:
-    price = t["price"]
-    atr = t["atr14"] or (price * 0.02)
+    price = _pos(t["price"], 0.0)
+    atr = _pos(t.get("atr14"), price * 0.02)
     th = CONFIG.thresholds
     # Structurally clamp to <= 2 trading days no matter what the caller asks for.
     horizon = min(horizon or CONFIG.horizon_days, 2)

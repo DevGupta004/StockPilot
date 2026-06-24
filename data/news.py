@@ -54,8 +54,13 @@ class NewsProvider(ABC):
     name = "base"
 
     @abstractmethod
-    def fetch(self, ticker: str, hours: int) -> list[dict]:
-        """Return a list of article dicts: title, url, source, published, sentiment."""
+    def fetch(self, ticker: str, hours: int) -> list[dict] | None:
+        """Articles (title/url/source/published/sentiment).
+
+        Return a list (possibly empty = genuinely no news) on a SUCCESSFUL contact, or
+        ``None`` if the provider could not be reached / is unconfigured — so the caller
+        can avoid caching a transient failure for the whole day.
+        """
 
 
 # --------------------------------------------------------------------------- #
@@ -65,10 +70,10 @@ class MarketauxProvider(NewsProvider):
     name = "marketaux"
     BASE = "https://api.marketaux.com/v1/news/all"
 
-    def fetch(self, ticker: str, hours: int) -> list[dict]:
+    def fetch(self, ticker: str, hours: int) -> list[dict] | None:
         if not CONFIG.marketaux_api_key:
             log("marketaux: no API key configured")
-            return []
+            return None
         import httpx
 
         symbol = ticker.split(".")[0]  # Marketaux accepts bare NSE symbols
@@ -90,7 +95,7 @@ class MarketauxProvider(NewsProvider):
                 payload = resp.json()
         except Exception as exc:  # noqa: BLE001
             log(f"marketaux: fetch failed for {ticker}: {exc}")
-            return []
+            return None
 
         out: list[dict] = []
         for art in payload.get("data", []):
@@ -123,26 +128,30 @@ class RSSProvider(NewsProvider):
         "https://www.business-standard.com/rss/markets-106.rss",
     ]
 
-    def fetch(self, ticker: str, hours: int) -> list[dict]:
+    def fetch(self, ticker: str, hours: int) -> list[dict] | None:
         try:
             import feedparser
             from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
         except ImportError as exc:
             log(f"rss: missing dependency: {exc}")
-            return []
+            return None
 
         term = term_for(ticker).lower()
         short = ticker.split(".")[0].lower()
         analyzer = SentimentIntensityAnalyzer()
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         out: list[dict] = []
+        feeds_ok = 0
 
         for feed_url in self.FEEDS:
             try:
                 parsed = feedparser.parse(feed_url)
+                if getattr(parsed, "bozo", 0) and not parsed.entries:
+                    raise ValueError(getattr(parsed, "bozo_exception", "parse error"))
             except Exception as exc:  # noqa: BLE001
                 log(f"rss: feed failed {feed_url}: {exc}")
                 continue
+            feeds_ok += 1
             for entry in parsed.entries[:50]:
                 title = entry.get("title", "")
                 summary = entry.get("summary", "")
@@ -160,7 +169,8 @@ class RSSProvider(NewsProvider):
                     "published": published.isoformat() if published else "",
                     "sentiment": float(score),
                 })
-        return out
+        # If every feed errored, signal failure (None) so the day isn't cached empty.
+        return out if feeds_ok else None
 
 
 def _entry_dt(entry) -> datetime | None:
@@ -205,13 +215,19 @@ def get_news_sentiment(ticker: str, hours: int | None = None) -> dict:
 
     articles: list[dict] = []
     used = "none"
+    contacted = False  # did ANY provider answer (even with no news)?
     for prov_name in order:
         provider = _make_provider(prov_name)
-        articles = provider.fetch(ticker, window)
+        fetched = provider.fetch(ticker, window)
+        if fetched is None:  # provider unreachable/unconfigured — try the next
+            log(f"news: {prov_name} unavailable for {ticker}, trying fallback")
+            continue
+        contacted = True
         used = provider.name
-        if articles:
+        articles = fetched
+        if articles:  # got real news — stop; otherwise let a later provider try too
             break
-        log(f"news: {prov_name} returned nothing for {ticker}, trying fallback")
+        log(f"news: {prov_name} found no articles for {ticker}, trying fallback")
 
     scores = [a["sentiment"] for a in articles if a.get("sentiment") is not None]
     aggregate = sum(scores) / len(scores) if scores else 0.0
@@ -224,5 +240,10 @@ def get_news_sentiment(ticker: str, hours: int | None = None) -> dict:
         "events": _flag_events(articles),
         "articles": articles[:10],
     }
-    _CACHE.set("news", ticker, result)
+    # Only cache a real result. If every provider was unreachable, return a neutral
+    # result but DON'T cache it, so a transient outage doesn't poison the whole day.
+    if contacted:
+        _CACHE.set("news", ticker, result)
+    else:
+        result["provider"] = "none (all sources unavailable)"
     return result

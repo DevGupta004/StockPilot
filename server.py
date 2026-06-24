@@ -14,11 +14,20 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Bounded parallelism for the per-symbol scan. The cold daily fetch of a large
+# universe (e.g. nifty500) is I/O-bound; a small pool cuts wall-time dramatically
+# while staying gentle enough not to trip provider rate limits. Tune via env.
+try:
+    _SCAN_WORKERS = max(1, min(16, int(os.environ.get("STOCK_SCAN_WORKERS", "6"))))
+except ValueError:
+    _SCAN_WORKERS = 6
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -163,6 +172,39 @@ def _analyze_one(ticker: str, min_confidence: float, horizon: int | None = None,
     return cand
 
 
+def _analyze_many(symbols: list[str], min_confidence: float, horizon: int | None,
+                  clock: dict, entry_today: bool = False
+                  ) -> tuple[list[scoring.Candidate], list[str]]:
+    """Analyze symbols concurrently (bounded pool). Returns (candidates, failed).
+
+    Order of ``symbols`` is preserved in the output. Each symbol is fully isolated:
+    one symbol raising never aborts the scan — it is recorded as failed and the rest
+    continue. Network fetches inside ``_analyze_one`` are individually retry-wrapped.
+    """
+    results: list[scoring.Candidate | None] = [None] * len(symbols)
+    failed: list[str] = []
+
+    def _task(idx_sym: tuple[int, str]) -> None:
+        idx, sym = idx_sym
+        try:
+            results[idx] = _analyze_one(sym, min_confidence, horizon, clock, entry_today)
+        except Exception as exc:  # noqa: BLE001 - never let one symbol kill the scan
+            log(f"pipeline: unexpected error for {sym}: {exc}")
+            results[idx] = None
+
+    workers = max(1, min(_SCAN_WORKERS, len(symbols)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_task, enumerate(symbols)))
+
+    cands: list[scoring.Candidate] = []
+    for sym, c in zip(symbols, results):
+        if c is None:
+            failed.append(sym)
+        else:
+            cands.append(c)
+    return cands, failed
+
+
 def _attach_live(picks: list[scoring.Candidate]) -> None:
     """Fetch the near-live quote for the FINAL shortlist only (cheap, block-safe)."""
     for c in picks:
@@ -299,20 +341,17 @@ def _run_scan(*, universe: str | None, min_confidence: float | None,
         f"max_price={cap}, capital={capital}, delivery_only={deliv}, "
         f"horizon={horizon}, session={clock['session']}")
 
+    analyzed, failed = _analyze_many(
+        symbols, min_confidence, horizon, clock, entry_today)
     cands: list[scoring.Candidate] = []
-    failed: list[str] = []
     over_price: list[str] = []
     shorts_skipped: list[str] = []
-    for sym in symbols:
-        c = _analyze_one(sym, min_confidence, horizon, clock, entry_today)
-        if c is None:
-            failed.append(sym)
-            continue
+    for c in analyzed:
         if cap is not None and c.price > cap:
-            over_price.append(sym)
+            over_price.append(c.ticker)
             continue
         if deliv and c.direction == "SHORT":
-            shorts_skipped.append(sym)  # delivery can't hold shorts
+            shorts_skipped.append(c.ticker)  # delivery can't hold shorts
             continue
         cands.append(c)
 
@@ -555,24 +594,36 @@ def scan_volume_spikes(universe: str | None = None, min_surge: float | None = No
 
     surged: list[tuple[float, scoring.Candidate]] = []
     failed: list[str] = []
-    for sym in symbols:
-        df = get_ohlcv(sym)  # cached per-day
-        if df is None:
-            failed.append(sym)
-            continue
-        vs = ind.volume_surge(df)
-        if vs is None or vs["surge_ratio"] < min_surge:
-            continue
-        if cap is not None and float(df["Close"].iloc[-1]) > cap:
-            continue
-        c = _analyze_one(sym, min_confidence, horizon=2, clock=clock)  # hits cache
-        if c is None:
-            failed.append(sym)
-            continue
-        if deliv and c.direction == "SHORT":
-            continue
-        c.volume = vs
-        surged.append((vs["surge_ratio"], c))
+
+    def _scan_one(sym: str):
+        """Fetch + surge-filter + analyze one symbol. Returns (ratio, cand), 'fail', or None."""
+        try:
+            df = get_ohlcv(sym)  # cached per-day
+            if df is None:
+                return "fail"
+            vs = ind.volume_surge(df)
+            if vs is None or vs["surge_ratio"] < min_surge:
+                return None
+            if cap is not None and float(df["Close"].iloc[-1]) > cap:
+                return None
+            c = _analyze_one(sym, min_confidence, horizon=2, clock=clock)  # hits cache
+            if c is None:
+                return "fail"
+            if deliv and c.direction == "SHORT":
+                return None
+            c.volume = vs
+            return (vs["surge_ratio"], c)
+        except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
+            log(f"scan_volume_spikes: error for {sym}: {exc}")
+            return "fail"
+
+    workers = max(1, min(_SCAN_WORKERS, len(symbols)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for sym, res in zip(symbols, pool.map(_scan_one, symbols)):
+            if res == "fail":
+                failed.append(sym)
+            elif res is not None:
+                surged.append(res)
 
     if not surged:
         return {

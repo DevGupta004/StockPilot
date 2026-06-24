@@ -70,6 +70,62 @@ class YFinanceProvider(MarketProvider):
 
 
 # --------------------------------------------------------------------------- #
+# Yahoo chart API (keyless fallback) — same data backend as yfinance, but a
+# completely independent code path: our own httpx session, User-Agent, and
+# rate-limit bucket. This survives the most common yfinance-library failures
+# (stale cookie/crumb, internal session rate-limit, lib version breakage), so it
+# is a genuine second source with no API key required.
+# --------------------------------------------------------------------------- #
+class YahooChartProvider(MarketProvider):
+    name = "yahoo_chart"
+    HOSTS = ("https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com")
+    _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+    def fetch(self, ticker: str, lookback_days: int) -> pd.DataFrame | None:
+        import httpx
+
+        # Pick a range bucket comfortably larger than the lookback.
+        rng = "2y" if lookback_days > 250 else "1y" if lookback_days > 120 else "6mo"
+        params = {"range": rng, "interval": "1d", "includeAdjustedClose": "true"}
+        last_exc: Exception | None = None
+        for host in self.HOSTS:  # try both Yahoo hosts before giving up
+            url = f"{host}/v8/finance/chart/{ticker}"
+            try:
+                with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+                    resp = client.get(url, params=params,
+                                      headers={"User-Agent": self._UA})
+                    resp.raise_for_status()
+                    payload = resp.json()
+                chart = (payload or {}).get("chart", {})
+                if chart.get("error"):
+                    log(f"yahoo_chart: {chart['error']} for {ticker}")
+                    continue
+                results = chart.get("result") or []
+                if not results:
+                    continue
+                res = results[0]
+                ts = res.get("timestamp") or []
+                quote = (res.get("indicators", {}).get("quote") or [{}])[0]
+                if not ts or not quote:
+                    continue
+                df = pd.DataFrame({
+                    "Open": quote.get("open"),
+                    "High": quote.get("high"),
+                    "Low": quote.get("low"),
+                    "Close": quote.get("close"),
+                    "Volume": quote.get("volume"),
+                }, index=pd.to_datetime(ts, unit="s"))
+                df = df[_OHLCV_COLS].dropna()
+                return df if not df.empty else None
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                continue
+        if last_exc:
+            log(f"yahoo_chart: fetch failed for {ticker}: {last_exc}")
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Twelve Data (fallback) — free tier ~800 calls/day, global incl. India.
 # --------------------------------------------------------------------------- #
 class TwelveDataProvider(MarketProvider):
@@ -125,8 +181,20 @@ def _split_nse(ticker: str) -> tuple[str, str | None]:
     return ticker, None
 
 
+_PROVIDERS: dict[str, type[MarketProvider]] = {
+    "yfinance": YFinanceProvider,
+    "yahoo_chart": YahooChartProvider,
+    "twelvedata": TwelveDataProvider,
+}
+
+# Order in which sources are tried. yfinance first (richest), then the keyless raw
+# Yahoo path (independent session — survives yfinance lib/session failures), then
+# Twelve Data only if a key is configured.
+_FALLBACK_ORDER = ["yfinance", "yahoo_chart", "twelvedata"]
+
+
 def _make_provider(name: str) -> MarketProvider:
-    return TwelveDataProvider() if name == "twelvedata" else YFinanceProvider()
+    return _PROVIDERS.get(name, YFinanceProvider)()
 
 
 def get_ohlcv(ticker: str, lookback_days: int | None = None) -> pd.DataFrame | None:
@@ -142,12 +210,13 @@ def get_ohlcv(ticker: str, lookback_days: int | None = None) -> pd.DataFrame | N
         try:
             df = pd.read_json(io.StringIO(cached), orient="split")
             if not df.empty:
+                df.attrs["provider"] = "cache"  # to_json drops attrs; tag the read
                 return df
         except ValueError as exc:
             log(f"cache: bad ohlcv frame for {ticker}: {exc}")
 
     primary = CONFIG.providers.market
-    order = [primary] + [p for p in ("yfinance", "twelvedata") if p != primary]
+    order = [primary] + [p for p in _FALLBACK_ORDER if p != primary]
 
     for prov_name in order:
         provider = _make_provider(prov_name)
