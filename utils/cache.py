@@ -57,3 +57,10 @@ class DayCache:
         if isinstance(wrapped, dict) and "data" in wrapped:
             return wrapped["data"]
         return wrapped
+
+    def age_seconds(self, namespace: str, key: str) -> float | None:
+        """Seconds since this entry was written, or None if absent/unknown."""
+        wrapped = self.get(namespace, key)
+        if isinstance(wrapped, dict) and "_ts" in wrapped:
+            return max(0.0, time.time() - float(wrapped["_ts"]))
+        return None

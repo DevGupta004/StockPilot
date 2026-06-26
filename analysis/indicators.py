@@ -13,6 +13,8 @@ import math
 import numpy as np
 import pandas as pd
 
+from config import CONFIG
+
 
 def _clean(value: float, fallback: float) -> float:
     """Return ``value`` rounded to a finite float, or ``fallback`` if NaN/inf.
@@ -84,13 +86,17 @@ def _obv(df: pd.DataFrame) -> pd.Series:
     return (direction * df["Volume"]).cumsum()
 
 
-def volume_surge(df: pd.DataFrame, window: int = 7, base: int = 20) -> dict | None:
+def volume_surge(df: pd.DataFrame, window: int | None = None,
+                 base: int | None = None) -> dict | None:
     """Detect a volume increase over the last `window` bars vs the prior `base` bars.
 
-    Returns a JSON-safe dict (surge_ratio, max_day_spike, price_change_7d_pct, bias,
-    raw averages) or None if the frame is too short (< window + base bars).
+    Windows default to the configured VOLUME_WINDOW / VOLUME_BASE (.env). Returns a
+    JSON-safe dict (surge_ratio, max_day_spike, price_change_7d_pct, bias, raw averages)
+    or None if the frame is too short (< window + base bars).
     bias: ACCUMULATION (vol up & price up) / DISTRIBUTION (vol up & price down) / MIXED.
     """
+    window = CONFIG.thresholds.volume_window if window is None else window
+    base = CONFIG.thresholds.volume_base if base is None else base
     if df is None or len(df) < window + base:
         return None
     vol = df["Volume"]
@@ -142,7 +148,8 @@ def compute(df: pd.DataFrame) -> dict:
     obv = _obv(df)
 
     vol = df["Volume"]
-    vol_avg20 = float(vol.rolling(20).mean().iloc[-1])
+    vbase = CONFIG.thresholds.volume_base
+    vol_avg20 = float(vol.rolling(vbase).mean().iloc[-1])
     vol_last = float(vol.iloc[-1])
 
     def _f(series: pd.Series) -> float:

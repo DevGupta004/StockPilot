@@ -91,13 +91,29 @@ class Weights:
 class Thresholds:
     # Default confidence bar separating ACTIONABLE from LOW CONFIDENCE.
     min_confidence: float = _env_float("MIN_CONFIDENCE", 0.55)
-    # Volume spike multiple vs 20-day average to count as a confirming signal.
+    # Volume spike multiple vs the baseline average to count as a confirming signal.
     volume_spike: float = _env_float("VOLUME_SPIKE_MULT", 1.5)
-    # Default 7-day vs baseline volume surge multiple for scan_volume_spikes.
+    # Default recent-vs-baseline volume surge multiple for scan_volume_spikes.
     min_surge: float = _env_float("MIN_SURGE", 2.0)
+    # Volume lookback windows (trading days). `volume_base` = the "normal" baseline
+    # (~1 month); `volume_window` = the recent burst compared against it. Match the
+    # recent window to the holding horizon (short for 1-2 day swings).
+    volume_base: int = _env_int("VOLUME_BASE", 20)
+    volume_window: int = _env_int("VOLUME_WINDOW", 7)
+    # Below this (last-bar volume / baseline avg) volume is "drying up" → conviction
+    # penalty on the LONG technical score.
+    dry_volume_ratio: float = _env_float("DRY_VOLUME_RATIO", 0.6)
     # ATR multiples used to derive target / stop.
     atr_target_mult: float = _env_float("ATR_TARGET_MULT", 1.5)
     atr_stop_mult: float = _env_float("ATR_STOP_MULT", 1.0)
+    # Deepest pullback (in ATRs below spot) the entry is allowed to ask for. EMA21 is
+    # often 5-8% below a trending stock — unreachable inside a 1-2 day hold — so the
+    # buy level is clamped to at most this shallow, fillable dip, with a buy-at-open
+    # fallback. Raise to wait for deeper dips, lower (→0) to enter nearer market.
+    max_pullback_atr: float = _env_float("MAX_PULLBACK_ATR", 0.5)
+    # In a RISK-OFF market (Nifty down-trend), LONG-only delivery picks face a headwind;
+    # confidence is multiplied by this factor (picks still shown, just downgraded).
+    risk_off_factor: float = _env_float("RISK_OFF_FACTOR", 0.85)
 
 
 @dataclass(frozen=True)
@@ -118,6 +134,10 @@ class Config:
     horizon_days: int = HORIZON_DAYS
     lookback_days: int = _env_int("LOOKBACK_DAYS", 270)  # ~9 months of dailies
     news_lookback_hours: int = _env_int("NEWS_LOOKBACK_HOURS", 72)
+    # How far back to scan NSE corporate announcements for a fresh catalyst. Wide
+    # enough to catch a marinating trigger (e.g. a takeover/stake disclosure that
+    # moves the stock days later); recency-weighting keeps fresh filings dominant.
+    catalyst_lookback_hours: int = _env_int("CATALYST_LOOKBACK_HOURS", 240)
     weights: Weights = field(default_factory=Weights)
     thresholds: Thresholds = field(default_factory=Thresholds)
     providers: Providers = field(default_factory=Providers)

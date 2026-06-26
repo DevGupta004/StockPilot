@@ -63,8 +63,15 @@ class Candidate:
     buy_by: str = ""                  # planned entry session (date + open)
     sell_by: str = ""                 # hard sell deadline (date + close, T+horizon)
     volume: dict | None = None        # 7-day volume-surge block (scan_volume_spikes)
+    catalysts: dict | None = None     # NSE corporate-catalyst block (filled post-rank)
     # Position sizing (filled after ranking; zeros until then).
     position: dict | None = None  # {shares, deploy, risk_amount, capital_pct, note}
+    # Chart-pattern enrichment (filled post-rank for chart-enabled tools only).
+    chart: dict | None = None         # {sparkline_30d, ascii, window_bars}
+    patterns: dict | None = None      # detect() feature block + pattern_score
+    final_score: float | None = None  # blended confidence + pattern_score (best-of-N)
+    best: bool = False                # winner of the best-of-N chart+signal blend
+    best_reason: str = ""             # why this one was picked as best
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -164,11 +171,20 @@ def _technical_signals(t: dict) -> tuple[float, list[str], str]:
     if price <= t["bb_lower"] * 1.01 and price > t["ema50"]:
         bull.append("pullback to lower Bollinger band in uptrend")
 
+    # Dry-volume penalty: a breakout/trend on volume well below its 20-day average has
+    # no conviction behind it (the engine kept picking such names, e.g. KALYANKJIL at
+    # 0.08x). Flag it and shave the technical score for the LONG case.
+    vr = t.get("vol_spike_ratio", 1.0)
+    dry_volume = vr < CONFIG.thresholds.dry_volume_ratio
+
     n_bull, n_bear = len(bull), len(bear)
     if n_bull >= n_bear:
         # Scale: ~8 possible bullish confirmations -> saturate near 1.
         score = min(1.0, n_bull / 8.0)
-        return score, bull, "LONG"
+        if dry_volume:
+            score *= 0.85
+            bull = bull + [f"⚠ volume drying ({vr:.2f}x avg) — weak conviction"]
+        return round(score, 4), bull, "LONG"
     score = min(1.0, n_bear / 8.0)
     return score, bear, "SHORT"
 
@@ -206,20 +222,29 @@ def _entry_exit(t: dict, direction: str,
 
     if direction == "LONG":
         ema21 = t["ema21"]
-        if price > ema21:
-            entry = {
-                "level": round(ema21, 2),
-                "condition": f"buy on pullback toward EMA21 ≈ ₹{ema21:.2f}",
-                "when": "next session, intraday",
-            }
-            base = ema21
+        # Deepest dip we may ask for in the holding window. EMA21 is frequently
+        # 5-8% below a trending name — unreachable in 1-2 days — so clamp the buy
+        # level to a shallow, fillable dip (≤ max_pullback_atr × ATR below spot).
+        dip_floor = price - th.max_pullback_atr * atr
+        if price > ema21 and ema21 >= dip_floor:
+            # EMA21 sits within a reachable dip — use it.
+            level = round(ema21, 2)
+            cond = (f"buy on pullback toward EMA21 ≈ ₹{ema21:.2f} "
+                    f"(else buy at open on strength)")
+            when = "next session, intraday"
+        elif price > ema21:
+            # EMA21 too far below — ask only for a shallow dip, fallback to open.
+            level = round(dip_floor, 2)
+            cond = (f"buy on dip to ₹{dip_floor:.2f} "
+                    f"(~{th.max_pullback_atr:g}×ATR); else buy at open on strength")
+            when = "next session, intraday"
         else:
-            entry = {
-                "level": round(price, 2),
-                "condition": f"buy at/near market ₹{price:.2f} on strength",
-                "when": "next session open",
-            }
-            base = price
+            # Price at/below EMA21 already — buy at/near market on strength.
+            level = round(price, 2)
+            cond = f"buy at/near market ₹{price:.2f} on strength"
+            when = "next session open"
+        entry = {"level": level, "condition": cond, "when": when}
+        base = level
         target = max(t["recent_high20"], base + th.atr_target_mult * atr)
         stop = base - th.atr_stop_mult * atr
     else:  # SHORT
@@ -314,10 +339,11 @@ def score_symbol(ticker: str, company: str, indicators: dict, news: dict,
     )
 
 
-def rank_and_grade(cands: list[Candidate], min_confidence: float) -> list[Candidate]:
-    """Sort by score desc, take top 3, assign ranks, (re)grade against the bar."""
+def rank_and_grade(cands: list[Candidate], min_confidence: float,
+                   top_n: int = 3) -> list[Candidate]:
+    """Sort by score desc, take top_n, assign ranks, (re)grade against the bar."""
     cands.sort(key=lambda c: c.score, reverse=True)
-    top = cands[:3]
+    top = cands[:top_n]
     for i, c in enumerate(top, start=1):
         c.rank = i
         c.label = grade(c.confidence, min_confidence)

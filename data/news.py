@@ -37,6 +37,26 @@ _TICKER_TERMS = {
     "ADANIENT.NS": "Adani Enterprises", "TATASTEEL.NS": "Tata Steel",
     "HCLTECH.NS": "HCL Technologies", "NTPC.NS": "NTPC", "POWERGRID.NS": "Power Grid",
     "ONGC.NS": "ONGC",
+    # Names that have appeared in this engine's picks — map to the full company name so
+    # matching is a precise phrase, not a fragile bare-symbol substring (e.g. the 3-char
+    # "SCI" was matching unrelated articles).
+    "SCI.NS": "Shipping Corporation of India", "ABCAPITAL.NS": "Aditya Birla Capital",
+    "DELHIVERY.NS": "Delhivery", "KALYANKJIL.NS": "Kalyan Jewellers",
+    "TATACHEM.NS": "Tata Chemicals", "AADHARHFC.NS": "Aadhar Housing Finance",
+    "EXIDEIND.NS": "Exide Industries", "BATAINDIA.NS": "Bata India",
+    "GICRE.NS": "GIC Re", "MMTC.NS": "MMTC", "IDBI.NS": "IDBI Bank",
+    "UCOBANK.NS": "UCO Bank", "AARTIIND.NS": "Aarti Industries",
+    "SONATSOFTW.NS": "Sonata Software", "TATACAP.NS": "Tata Capital",
+    "NIACL.NS": "New India Assurance",
+}
+
+# Group/common tokens that are NOT distinctive on their own — a bare "tata" or "bank"
+# match would pull in unrelated names. Phrase matching uses the full term so these are
+# only excluded when deriving the single-token fallback.
+_COMMON_TOKENS = {
+    "tata", "bajaj", "aditya", "birla", "adani", "bank", "india", "indian",
+    "limited", "ltd", "industries", "corporation", "company", "finance", "capital",
+    "new", "of", "the",
 }
 
 _EVENT_PATTERNS = {
@@ -48,6 +68,34 @@ _EVENT_PATTERNS = {
 
 def term_for(ticker: str) -> str:
     return _TICKER_TERMS.get(ticker.upper(), ticker.split(".")[0])
+
+
+def _ticker_matchers(ticker: str) -> list[re.Pattern]:
+    """Compiled patterns that confirm an article is about ``ticker``.
+
+    Precision over recall: a mapped company name is matched as a word-boundary phrase
+    (e.g. ``shipping corporation of india``), plus a distinctive single token, plus the
+    bare symbol only as a *whole word* of length >= 4. This kills the old failure where
+    a 3-char substring ("sci") matched unrelated articles.
+    """
+    pats: list[re.Pattern] = []
+    mapped = _TICKER_TERMS.get(ticker.upper())
+    if mapped:
+        toks = re.findall(r"[a-z0-9]+", mapped.lower())
+        if toks:
+            phrase = r"\b" + r"\s+".join(re.escape(t) for t in toks) + r"\b"
+            pats.append(re.compile(phrase))
+        distinctive = [t for t in toks if len(t) >= 4 and t not in _COMMON_TOKENS]
+        for t in distinctive[:2]:
+            pats.append(re.compile(rf"\b{re.escape(t)}\b"))
+    short = ticker.split(".")[0].lower()
+    if len(short) >= 4:  # whole-word, 4+ chars — avoids 3-letter false positives
+        pats.append(re.compile(rf"\b{re.escape(short)}\b"))
+    return pats
+
+
+def _article_matches(matchers: list[re.Pattern], blob: str) -> bool:
+    return any(p.search(blob) for p in matchers)
 
 
 class NewsProvider(ABC):
@@ -136,8 +184,7 @@ class RSSProvider(NewsProvider):
             log(f"rss: missing dependency: {exc}")
             return None
 
-        term = term_for(ticker).lower()
-        short = ticker.split(".")[0].lower()
+        matchers = _ticker_matchers(ticker)
         analyzer = SentimentIntensityAnalyzer()
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         out: list[dict] = []
@@ -156,7 +203,7 @@ class RSSProvider(NewsProvider):
                 title = entry.get("title", "")
                 summary = entry.get("summary", "")
                 blob = f"{title} {summary}".lower()
-                if term not in blob and short not in blob:
+                if not _article_matches(matchers, blob):
                     continue
                 published = _entry_dt(entry)
                 if published and published < cutoff:

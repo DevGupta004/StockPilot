@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import io
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -24,6 +24,42 @@ from utils.retry import retry_call
 
 _CACHE = DayCache(CONFIG.cache_dir)
 _OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
+
+IST = timezone(timedelta(hours=5, minutes=30))
+_MKT_CLOSE_H, _MKT_CLOSE_M = 15, 30  # NSE close 15:30 IST
+# Re-attempt a stale-by-bar cache entry at most this often (seconds). Guards against
+# refetching every call when the provider itself lags behind the expected session.
+_STALE_REFRESH_SEC = 1800  # 30 min
+
+
+def expected_last_bar_date() -> date:
+    """The date of the newest *completed* daily bar we should have by now.
+
+    Weekday holidays are not modelled (NSE holiday calendar varies); this is a
+    freshness floor — if cached data is older than this, it is definitely stale.
+    Rolls weekends back to Friday; before today's close, expects the prior session.
+    """
+    now = datetime.now(IST)
+    d = now.date()
+    # Roll a weekend back to Friday.
+    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+        d -= timedelta(days=1)
+    # If it's a weekday but today's session hasn't closed yet, the newest completed
+    # daily bar is the previous trading day.
+    if d == now.date():
+        before_close = (now.hour, now.minute) < (_MKT_CLOSE_H, _MKT_CLOSE_M)
+        if before_close:
+            d -= timedelta(days=1)
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+    return d
+
+
+def _frame_last_date(df: pd.DataFrame) -> date | None:
+    try:
+        return pd.Timestamp(df.index[-1]).date()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class MarketProvider(ABC):
@@ -205,13 +241,30 @@ def get_ohlcv(ticker: str, lookback_days: int | None = None) -> pd.DataFrame | N
     """
     lookback = lookback_days or CONFIG.lookback_days
 
+    # Load the per-day cache. Keep it only if its newest bar is recent enough; a frame
+    # whose last bar predates the expected last completed session is STALE (provider
+    # lag can write a day-old frame that the per-day cache would otherwise serve all
+    # day). Stale frames are kept as a fallback in case the refetch fails.
+    stale_df: pd.DataFrame | None = None
     cached = _CACHE.get_data("ohlcv", ticker)
     if cached is not None:
         try:
             df = pd.read_json(io.StringIO(cached), orient="split")
             if not df.empty:
-                df.attrs["provider"] = "cache"  # to_json drops attrs; tag the read
-                return df
+                last = _frame_last_date(df)
+                fresh = last is not None and last >= expected_last_bar_date()
+                # A stale-by-bar entry is only worth refetching once per refresh window:
+                # if the provider simply lags (holiday / not-yet-published session) the
+                # cache will never reach `expected`, so accept it rather than hammer the
+                # provider on every call (esp. the 500-symbol scan).
+                age = _CACHE.age_seconds("ohlcv", ticker) or 0.0
+                if fresh or age < _STALE_REFRESH_SEC:
+                    df.attrs["provider"] = "cache" if fresh else "cache-stale"
+                    return df
+                df.attrs["provider"] = "cache-stale"
+                stale_df = df  # genuinely old — try a refetch, fall back on failure
+                log(f"cache: stale ohlcv for {ticker} (last bar {last} < expected "
+                    f"{expected_last_bar_date()}, age {age:.0f}s); refetching")
         except ValueError as exc:
             log(f"cache: bad ohlcv frame for {ticker}: {exc}")
 
@@ -240,6 +293,12 @@ def get_ohlcv(ticker: str, lookback_days: int | None = None) -> pd.DataFrame | N
                 log(f"cache: could not serialise {ticker}: {exc}")
             return df
         log(f"market: {prov_name} insufficient data for {ticker}, trying fallback")
+
+    # Every provider failed. A stale cached frame beats nothing — return it flagged so
+    # the freshness line can warn, rather than dropping the symbol entirely.
+    if stale_df is not None:
+        log(f"market: refetch failed for {ticker}, serving STALE cache")
+        return stale_df
 
     log(f"market: ALL providers failed for {ticker}")
     return None
