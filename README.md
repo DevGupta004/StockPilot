@@ -35,6 +35,7 @@ sentiment.
 | `predict_delivery_2day(...)` | Top 3 LONG delivery trades to hold up to **2 trading days (T+2)**. |
 | `predict_buy_today_sell_tomorrow(...)` | Top 3 LONG delivery trades, **T+1** (buy this session, exit next day's close). |
 | `scan_volume_spikes(min_surge=None, top_n=10)` | Stocks with a **≥`min_surge`× 7-day volume surge** + full trade plan + accumulation/distribution bias. `min_surge` omitted → `MIN_SURGE` env (default 2.0). |
+| `scan_oversold(top_n=None, oversold_rsi=None, oversold_stoch=None, ...)` | Most **oversold** stocks (RSI-14 ≤ `oversold_rsi`; low Stochastic + sub-lower-Bollinger close deepen the rank) + full trade plan. `top_n` omitted → `OVERSOLD_TOP_N` env (default 5). |
 | `save_report(content, title="")` | Save a run's markdown to `reports/<branch>/<date>/<date>.md`. |
 | `analyze_stock(ticker)` | Full technical + news breakdown + verdict for one symbol. |
 | `get_technicals(ticker, lookback_days=180)` | Indicator snapshot + signal list. |
@@ -234,6 +235,17 @@ Sell-by + position sizing), ranked by surge strength. Each pick reports a **bias
 - *"Scan volume spikes with a 1.5× threshold"* → `min_surge=1.5` (overrides env).
 - No hits = nothing cleared the bar today; lower `min_surge` or widen the universe.
 
+### Scanning for oversold stocks
+> **"Which stocks are oversold?"** → `scan_oversold`
+
+Flags names with RSI-14 ≤ `oversold_rsi` (default 30), ranks by oversold depth (a low
+Stochastic %K and a close under the lower Bollinger band push a name higher), then runs
+the full delivery analysis on the top N (entry/target/stop/Buy-by/Sell-by + sizing).
+- *"Find oversold stocks"* → top `OVERSOLD_TOP_N` (env, default 5).
+- *"Top 10 oversold under ₹500"* → `top_n=10, max_price=500`.
+- *"Oversold with RSI under 25"* → `oversold_rsi=25`.
+- Oversold = stretched down, a **bounce** setup — NOT a guaranteed reversal.
+
 ### Drilling into one name
 - *"Analyze TCS.NS"* → `analyze_stock`: full technical + news + verdict for one symbol.
 - *"Show me the technicals for INFY.NS over the last 90 days"* → `get_technicals`.
@@ -248,6 +260,7 @@ Sell-by + position sizing), ranked by surge strength. Each pick reports a **bias
 | "predict for 2 days" / "delivery picks" | `predict_delivery_2day` |
 | "buy today sell tomorrow" | `predict_buy_today_sell_tomorrow` |
 | "where is volume spiking" / "scan volume surges" | `scan_volume_spikes` |
+| "which stocks are oversold" / "find oversold stocks" | `scan_oversold` |
 | "save this report" | `save_report` |
 | "analyze \<TICKER\>" / "full breakdown of \<TICKER\>" | `analyze_stock` |
 | "technicals for \<TICKER\>" / "indicators on \<TICKER\>" | `get_technicals` |
@@ -307,6 +320,8 @@ Everything tunable lives in `config.py` and is overridable via env vars:
 | `NEWS_LOOKBACK_HOURS` | `72` | News window |
 | `VOLUME_SPIKE_MULT` | `1.5` | Volume-spike threshold vs 20-day avg (confirming signal) |
 | `MIN_SURGE` | `2.0` | `scan_volume_spikes` default: 7-day vs baseline volume multiple to qualify |
+| `OVERSOLD_RSI` / `OVERSOLD_STOCH` | `30` / `20` | `scan_oversold`: RSI-14 ceiling to qualify; %K ceiling that deepens the score |
+| `OVERSOLD_TOP_N` | `5` | `scan_oversold` default: how many oversold names to return |
 | `ATR_TARGET_MULT` / `ATR_STOP_MULT` | `1.5` / `1.0` | Target/stop distance in ATRs |
 | `CACHE_DIR` | `.cache` | Per-day cache location |
 
