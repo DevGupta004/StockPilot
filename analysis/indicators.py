@@ -130,6 +130,54 @@ def volume_surge(df: pd.DataFrame, window: int | None = None,
     }
 
 
+def oversold(snapshot: dict, rsi_max: float | None = None,
+             stoch_max: float | None = None) -> dict:
+    """Classify an indicator snapshot as oversold and score how deep.
+
+    Primary gate is RSI-14 at/below `rsi_max` (default OVERSOLD_RSI). Stochastic %K
+    at/below `stoch_max` and a close beneath the lower Bollinger band deepen the score.
+    `oversold_score` (0..1) ranks how stretched-to-the-downside a name is — higher = more
+    oversold = a stronger mean-reversion (bounce) candidate. Oversold is NOT a buy on its
+    own; a name can keep falling. Returns a JSON-safe dict.
+    """
+    rsi_max = CONFIG.thresholds.oversold_rsi if rsi_max is None else rsi_max
+    stoch_max = CONFIG.thresholds.oversold_stoch if stoch_max is None else stoch_max
+
+    rsi = float(snapshot.get("rsi14", 50.0))
+    stoch_k = float(snapshot.get("stoch_k", 50.0))
+    price = float(snapshot.get("price", 0.0))
+    bb_low = float(snapshot.get("bb_lower", price))
+
+    below_band = price > 0 and price < bb_low
+    is_oversold = rsi <= rsi_max
+
+    reasons: list[str] = []
+    if is_oversold:
+        reasons.append(f"RSI-14 {rsi:.1f} ≤ {rsi_max:.0f}")
+    if stoch_k <= stoch_max:
+        reasons.append(f"Stochastic %K {stoch_k:.1f} ≤ {stoch_max:.0f}")
+    if below_band:
+        reasons.append("close below lower Bollinger band")
+
+    # Depth score: RSI is the backbone (how far below the threshold, scaled by the
+    # threshold itself), with bonuses for a confirming Stochastic and a sub-band close.
+    rsi_depth = max(0.0, (rsi_max - rsi) / rsi_max) if rsi_max > 0 else 0.0
+    stoch_bonus = 0.15 if stoch_k <= stoch_max else 0.0
+    band_bonus = 0.15 if below_band else 0.0
+    score = min(1.0, 0.70 * rsi_depth + stoch_bonus + band_bonus)
+
+    return {
+        "is_oversold": bool(is_oversold),
+        "rsi14": round(rsi, 2),
+        "stoch_k": round(stoch_k, 2),
+        "below_lower_band": bool(below_band),
+        "oversold_score": round(score, 4),
+        "rsi_max": rsi_max,
+        "stoch_max": stoch_max,
+        "reasons": reasons,
+    }
+
+
 def compute(df: pd.DataFrame) -> dict:
     """Compute the full indicator snapshot for the most recent bar.
 

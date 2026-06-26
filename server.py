@@ -899,6 +899,175 @@ def scan_volume_spikes(universe: str | None = None, min_surge: float | None = No
     return result
 
 
+def _oversold_table(picks: list[scoring.Candidate]) -> str:
+    """Oversold-scan view: RSI / Stochastic / score columns alongside trade levels."""
+    rows = [
+        "| # | Stock | RSI | %K | <BB | Score | Signal | Now | Buy by | Buy | Target "
+        "| Stop | Sell by | Qty |",
+        "|---|-------|-----|-----|-----|-------|--------|-----|--------|-----|--------"
+        "|------|---------|-----|",
+    ]
+    for c in picks:
+        flag = "✅" if c.label == scoring.ACTIONABLE else "⚠️"
+        short = " 🚫CNC" if c.direction == "SHORT" else ""
+        o = c.oversold or {}
+        qty = (c.position or {}).get("shares", "-")
+        now = f"₹{c.live_price}" if c.live_price is not None else "—"
+        band = "✓" if o.get("below_lower_band") else "—"
+        rows.append(
+            f"| {c.rank} | {c.ticker.replace('.NS', '')} | {o.get('rsi14','-')} "
+            f"| {o.get('stoch_k','-')} | {band} | {o.get('oversold_score','-')} "
+            f"| {flag} {c.confidence_pct}%{short} | {now} | {c.buy_by} "
+            f"| ₹{c.entry['level']} | ₹{c.target} | ₹{c.stop_loss} | {c.sell_by} | {qty} |"
+        )
+    return "\n".join(rows)
+
+
+@mcp.tool()
+def scan_oversold(universe: str | None = None, top_n: int | None = None,
+                  oversold_rsi: float | None = None,
+                  oversold_stoch: float | None = None,
+                  max_price: float | None = None, capital: float | None = None,
+                  risk_per_trade: float | None = None,
+                  delivery_only: bool | None = None) -> dict:
+    """Find the most OVERSOLD stocks in the universe + a full trade plan for each.
+
+    Scans the universe and flags names whose RSI-14 is at/below `oversold_rsi` (a
+    classic oversold reading), deepening the score when Stochastic %K is also low and
+    the close is beneath the lower Bollinger band. Survivors are ranked by how oversold
+    they are and the top N are returned with the same delivery analysis as the other
+    tools (entry/target/stop/Buy-by/Sell-by + a position sized to your capital).
+
+    Honest note: oversold means STRETCHED TO THE DOWNSIDE — a mean-reversion (bounce)
+    setup, NOT a guaranteed reversal. A falling knife can stay oversold for a while.
+    Research signal only.
+
+    Args:
+        universe: Preset name / inline list / default watchlist (as get_daily_picks).
+        top_n: How many oversold names to return. Omit to use OVERSOLD_TOP_N (.env,
+            default 5).
+        oversold_rsi: RSI-14 ceiling to qualify as oversold. Omit for OVERSOLD_RSI
+            (.env, default 30).
+        oversold_stoch: Stochastic %K ceiling that deepens the score. Omit for
+            OVERSOLD_STOCH (.env, default 20).
+        max_price / capital / risk_per_trade / delivery_only: as get_daily_picks; omit
+            to use the .env trading profile.
+
+    Returns:
+        A dict with header, market_status, generated_at, picks (each with an `oversold`
+        block: rsi14, stoch_k, below_lower_band, oversold_score, reasons), table,
+        markdown, and a mandatory disclaimer.
+    """
+    min_confidence = CONFIG.thresholds.min_confidence
+    top_n = CONFIG.thresholds.oversold_top_n if top_n is None else top_n
+    rsi_max = CONFIG.thresholds.oversold_rsi if oversold_rsi is None else oversold_rsi
+    stoch_max = (CONFIG.thresholds.oversold_stoch
+                 if oversold_stoch is None else oversold_stoch)
+    capital = CONFIG.capital if capital is None else capital
+    risk_per_trade = CONFIG.risk_per_trade if risk_per_trade is None else risk_per_trade
+    cap = max_price if max_price is not None else CONFIG.max_price
+    deliv = CONFIG.delivery_only if delivery_only is None else delivery_only
+    clock = _market_clock()
+    symbols = named_universe(universe)
+    if not symbols:
+        return {
+            "header": "0 candidates — could not load the stock universe (live NSE "
+                      "fetch failed after retries). Check connectivity and retry.",
+            "generated_at": _now_ist(),
+            "market_status": clock["status_line"],
+            "picks": [],
+            "disclaimer": DISCLAIMER,
+        }
+    if cap is not None and len(symbols) > 50:
+        symbols = prefilter_by_price(symbols, cap)
+    log(f"scan_oversold: scanning {len(symbols)}, rsi_max={rsi_max}, "
+        f"stoch_max={stoch_max}, top_n={top_n}, session={clock['session']}")
+
+    found: list[tuple[float, scoring.Candidate]] = []
+    failed: list[str] = []
+
+    def _scan_one(sym: str):
+        """Fetch + oversold-filter + analyze one symbol. Returns (score, cand), 'fail', None."""
+        try:
+            df = get_ohlcv(sym)  # cached per-day
+            if df is None:
+                return "fail"
+            if cap is not None and float(df["Close"].iloc[-1]) > cap:
+                return None
+            snap = ind.compute(df)
+            ov = ind.oversold(snap, rsi_max, stoch_max)
+            if not ov["is_oversold"]:
+                return None
+            c = _analyze_one(sym, min_confidence, horizon=2, clock=clock)  # hits cache
+            if c is None:
+                return "fail"
+            if deliv and c.direction == "SHORT":
+                return None
+            c.oversold = ov
+            return (ov["oversold_score"], c)
+        except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
+            log(f"scan_oversold: error for {sym}: {exc}")
+            return "fail"
+
+    workers = max(1, min(_SCAN_WORKERS, len(symbols)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for sym, res in zip(symbols, pool.map(_scan_one, symbols)):
+            if res == "fail":
+                failed.append(sym)
+            elif res is not None:
+                found.append(res)
+
+    if not found:
+        return {
+            "header": f"No stock was oversold (RSI-14 ≤ {rsi_max:.0f}) in this universe "
+                      f"today.",
+            "generated_at": _now_ist(),
+            "market_status": clock["status_line"],
+            "picks": [],
+            "failed_symbols": failed,
+            "disclaimer": DISCLAIMER,
+        }
+
+    found.sort(key=lambda x: x[0], reverse=True)  # most oversold first
+    picks = [c for _, c in found[:top_n]]
+    for i, c in enumerate(picks, start=1):
+        c.rank = i
+        c.label = scoring.grade(c.confidence, min_confidence)
+    _attach_live(picks)
+    for c in picks:
+        c.position = scoring.size_position(
+            c.entry["level"], c.stop_loss, c.direction, capital, risk_per_trade
+        )
+
+    actionable = sum(1 for c in picks if c.label == scoring.ACTIONABLE)
+    note = (f"{len(picks)} oversold stock(s) (RSI-14 ≤ {rsi_max:.0f}), most oversold "
+            f"first ({actionable} actionable). Oversold = stretched down, a bounce "
+            f"setup — NOT a guaranteed reversal.")
+    if deliv:
+        note += " Delivery (CNC) mode: LONG-only."
+    if cap is not None:
+        note += f" Filtered to ≤ ₹{cap:.0f}."
+
+    result = {
+        "header": note,
+        "generated_at": _now_ist(),
+        "market_status": clock["status_line"],
+        "data_freshness": _freshness_line(picks),
+        "actionable_count": actionable,
+        "horizon_days": 2,
+        "capital": capital,
+        "oversold_rsi": rsi_max,
+        "oversold_stoch": stoch_max,
+        "top_n": top_n,
+        "picks": [c.to_dict() for c in picks],
+        "table": _oversold_table(picks),
+        "failed_symbols": failed,
+        "disclaimer": DISCLAIMER,
+    }
+    result["markdown"] = _render_markdown(result, "scan_oversold")
+    return result
+
+
 @mcp.tool()
 def analyze_stock(ticker: str) -> dict:
     """Full technical + news breakdown and a graded short-swing verdict for one symbol.

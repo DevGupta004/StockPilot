@@ -114,6 +114,13 @@ class Thresholds:
     # In a RISK-OFF market (Nifty down-trend), LONG-only delivery picks face a headwind;
     # confidence is multiplied by this factor (picks still shown, just downgraded).
     risk_off_factor: float = _env_float("RISK_OFF_FACTOR", 0.85)
+    # Oversold scan (scan_oversold). A name qualifies as oversold when RSI-14 is at/below
+    # `oversold_rsi`; Stochastic %K at/below `oversold_stoch` and a close under the lower
+    # Bollinger band add to the oversold depth score. `oversold_top_n` = how many to
+    # return (the configurable "top N", default 5).
+    oversold_rsi: float = _env_float("OVERSOLD_RSI", 30.0)
+    oversold_stoch: float = _env_float("OVERSOLD_STOCH", 20.0)
+    oversold_top_n: int = _env_int("OVERSOLD_TOP_N", 5)
 
 
 @dataclass(frozen=True)

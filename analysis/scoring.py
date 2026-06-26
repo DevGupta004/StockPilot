@@ -63,6 +63,7 @@ class Candidate:
     buy_by: str = ""                  # planned entry session (date + open)
     sell_by: str = ""                 # hard sell deadline (date + close, T+horizon)
     volume: dict | None = None        # 7-day volume-surge block (scan_volume_spikes)
+    oversold: dict | None = None      # RSI/Stoch/BB oversold block (scan_oversold)
     catalysts: dict | None = None     # NSE corporate-catalyst block (filled post-rank)
     # Position sizing (filled after ranking; zeros until then).
     position: dict | None = None  # {shares, deploy, risk_amount, capital_pct, note}
